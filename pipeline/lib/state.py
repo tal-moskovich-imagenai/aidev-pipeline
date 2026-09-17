@@ -73,6 +73,17 @@ def set_state(ticket_key, state, pr_url=None):
             )
 
 
+def reopen_for_rework(ticket_key):
+    """DONE -> RUNNING, resets running_since and clears last_comment_id so the
+    rework comment is picked up as fresh context."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET state = 'RUNNING', running_since = datetime('now'), "
+            "last_comment_id = NULL, updated_at = datetime('now') WHERE ticket_key = ?",
+            (ticket_key,),
+        )
+
+
 def set_stuck(ticket_key, question):
     with db() as conn:
         conn.execute(

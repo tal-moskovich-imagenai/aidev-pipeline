@@ -14,16 +14,18 @@ Run this from cron (e.g. every 2-3 minutes), separate from pickup.py.
 import os
 import re
 import sys
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import config, jira_client, state, procs, lockfile
 from lib.pipelog import get_logger
 from lib.notify import notify
+from lib.soul import soul_section
 
 log = get_logger("monitor")
 
-COMPLETE_RE = re.compile(r"⏺\s*AIDEV_TASK_COMPLETE")
-NEEDS_INPUT_RE = re.compile(r"⏺\s*AIDEV_NEEDS_INPUT:\s*(.+)")
+COMPLETE_RE = re.compile(r"(?m)^\s*AIDEV_TASK_COMPLETE\s*$")
+NEEDS_INPUT_RE = re.compile(r"(?m)^\s*AIDEV_NEEDS_INPUT:\s*(.+)$")
 
 
 def is_complete(pane):
@@ -31,9 +33,11 @@ def is_complete(pane):
 
 
 def find_needs_input(pane):
-    """Returns the most recent AIDEV_NEEDS_INPUT question in the pane, or None."""
-    matches = NEEDS_INPUT_RE.findall(pane)
-    return matches[-1].strip() if matches else None
+    """Returns the most recent real AIDEV_NEEDS_INPUT question in the pane,
+    or None. Filters out the instructional placeholder line echoed from the
+    task prompt itself (contains the literal '<your question' template)."""
+    matches = [m.strip() for m in NEEDS_INPUT_RE.findall(pane) if "<your question" not in m]
+    return matches[-1] if matches else None
 
 
 def open_pr(ticket):
@@ -51,6 +55,14 @@ def open_pr(ticket):
         procs.sh(f"git commit -m {msg}", cwd=worktree_path, check=False)
 
     procs.sh(f"git push -u origin {branch}", cwd=worktree_path, check=False)
+
+    # Rework case: a PR may already exist for this branch — reuse it instead
+    # of creating a duplicate.
+    existing = procs.sh(
+        f"gh pr view {branch} --json url --jq .url", cwd=worktree_path, check=False
+    )
+    if existing and existing.startswith("https://"):
+        return existing.strip(), f"reused existing PR: {existing.strip()}"
 
     base = cfg["pr"]["base_branch"]
     title = f"{key}: automated by aidev"
@@ -218,6 +230,118 @@ def process_stuck_ticket(ticket):
         log(f"{key}: label warning: {e}")
 
 
+def relaunch_claude(ticket, prompt):
+    """Starts a fresh Claude Code session in the ticket's existing worktree/
+    branch (used for rework after human review feedback). Returns the new
+    session_id."""
+    worktree_path = ticket["worktree_path"]
+    tmux_name = ticket["tmux_session"]
+    cfg = config.load()
+    session_id = str(uuid.uuid4())
+
+    if procs.tmux_session_exists(tmux_name):
+        procs.tmux_kill(tmux_name)
+    procs.tmux_new_session(tmux_name)
+
+    prompt_file = os.path.join(worktree_path, ".aidev_prompt.txt")
+    with open(prompt_file, "w") as f:
+        f.write(prompt)
+
+    skip_perms = "--dangerously-skip-permissions" if cfg["claude"]["dangerously_skip_permissions"] else ""
+    claude_cmd = (
+        f"cd {worktree_path} && "
+        f"claude --session-id {session_id} {skip_perms} "
+        f"\"$(cat .aidev_prompt.txt)\""
+    )
+    procs.tmux_send(tmux_name, claude_cmd)
+    return session_id
+
+
+def build_rework_prompt(key, summary, feedback, pr_url):
+    steps = "\n".join(
+        f"{i+1}. Run the slash command: {s}"
+        for i, s in enumerate(config.load()["claude"]["post_steps"])
+    )
+    return f"""{soul_section()}You are addressing human review feedback on Jira ticket {key}: {summary}
+
+This ticket already has an open PR: {pr_url}
+You are in the same worktree and branch as before — the existing implementation
+is already committed and pushed. Do NOT start over or create a new branch.
+
+Reviewer feedback to address:
+{feedback}
+
+Task:
+- Make the changes needed to address the feedback above, in this worktree.
+- When done, run these steps in order:
+{steps}
+- Stage and commit ALL changes with a clear commit message that references {key}.
+- Then push to the existing branch (this updates the existing PR automatically
+  — do not open a new PR).
+
+If you are blocked and need clarification, print exactly:
+AIDEV_NEEDS_INPUT: <your question here, one line>
+and wait — a human will reply as a Jira comment and it will be relayed here.
+
+When you are fully done, committed, and pushed, say exactly: AIDEV_TASK_COMPLETE
+"""
+
+
+def process_done_ticket(ticket):
+    """DONE tickets whose Jira status was manually moved back to
+    in_progress_status are review-feedback re-opens: relaunch Claude in the
+    same worktree/branch to address the feedback, then land back on
+    review_status + aidev-done via the normal finish_ticket path."""
+    cfg = config.load()
+    key = ticket["ticket_key"]
+
+    try:
+        issue = jira_client.get_issue(key, fields=["status", "summary", "comment"])
+    except Exception as e:
+        log(f"{key}: could not fetch issue for rework check: {e}")
+        return
+
+    current_status = issue["fields"]["status"]["name"]
+    if current_status.lower() != cfg["jira"]["in_progress_status"].lower():
+        return  # still In Review / Done / whatever — nothing to do
+
+    log(f"{key}: moved back to {current_status} after DONE — treating as rework request")
+
+    comments = issue["fields"]["comment"]["comments"]
+    feedback = None
+    for c in reversed(comments):
+        text = jira_client.plain_description({"fields": {"description": c["body"]}})
+        if not text.strip().startswith("[aidev]") and not text.strip().startswith("✅"):
+            feedback = text
+            break
+
+    if not feedback:
+        feedback = "(No specific comment found — re-review the PR and address anything outstanding.)"
+
+    summary = issue["fields"]["summary"]
+    prompt = build_rework_prompt(key, summary, feedback, ticket.get("pr_url") or "")
+
+    session_id = relaunch_claude(ticket, prompt)
+    with state.db() as conn:
+        conn.execute(
+            "UPDATE tickets SET session_id = ? WHERE ticket_key = ?",
+            (session_id, key),
+        )
+    state.reopen_for_rework(key)
+
+    try:
+        jira_client.add_comment(
+            key,
+            f"[aidev] Picked up your feedback, resuming work in the same worktree/branch.\n"
+            f"Session ID: {session_id}",
+        )
+        jira_client.set_state_label(key, "aidev-picked")
+    except Exception as e:
+        log(f"{key}: could not post rework comment: {e}")
+
+    notify(f"aidev: {key} rework started", feedback[:200])
+
+
 def main():
     try:
         with lockfile.Lock("monitor"):
@@ -242,6 +366,14 @@ def _run():
             process_stuck_ticket(ticket)
         except Exception as e:
             log(f"ERROR processing stuck {ticket['ticket_key']}: {e}")
+
+    done = state.all_in_state("DONE")
+    log(f"Checking {len(done)} done ticket(s) for review re-opens")
+    for ticket in done:
+        try:
+            process_done_ticket(ticket)
+        except Exception as e:
+            log(f"ERROR processing done {ticket['ticket_key']}: {e}")
 
 
 if __name__ == "__main__":

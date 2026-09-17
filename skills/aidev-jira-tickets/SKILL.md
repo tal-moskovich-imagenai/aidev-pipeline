@@ -93,6 +93,23 @@ Don't manually set these labels — they're mutually exclusive and managed by
 `pickup.py`/`monitor.py` via `jira_client.set_state_label()`. Manually editing
 status while a ticket is `RUNNING` in the pipeline's state DB can desync it.
 
+## Review feedback loop
+
+You control the `In Review → Done` transition entirely — the pipeline never
+makes that call. If a PR needs changes after review:
+
+1. Move the ticket's status back to `In Progress` and leave a comment with
+   the feedback.
+2. The next `monitor.py` run detects a `DONE` ticket now sitting on
+   `In Progress` again, treats it as a rework request, and relaunches Claude
+   Code **in the same worktree and branch** with your comment as context.
+3. Claude addresses the feedback, re-runs the review steps, commits, and
+   pushes to the **same branch** — this updates the existing PR, no
+   duplicate is created.
+4. The ticket lands back on `In Review` + `aidev-done` once done, same as the
+   first pass. Repeat as many times as needed.
+5. When you're actually satisfied, move it to `Done` yourself.
+
 ## What the pipeline does NOT do
 
 - It does not infer dependency order from ticket text, epic links, or
