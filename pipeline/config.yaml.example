@@ -32,3 +32,9 @@ pr:
 
 state_db: "/Users/talmoskovich/jira-claude-pipeline/state/aidev.sqlite3"
 log_dir: "/Users/talmoskovich/jira-claude-pipeline/logs"
+
+notifications:
+  # Optional. Create at https://api.slack.com/apps -> your app -> Incoming
+  # Webhooks -> Activate -> Add New Webhook to Workspace. Leave unset to
+  # only get the native macOS notification (always on, no config needed).
+  slack_webhook_url: ""
