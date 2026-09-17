@@ -45,6 +45,33 @@ def build_task_prompt(issue):
 Description:
 {desc or '(no description provided)'}
 
+## Shared context — read before doing anything else
+
+The ticket description or comments above may reference "must read" material:
+absolute file paths (e.g. under `.claude-code/` in some other worktree —
+brainstorm docs, decisions, handoff notes shared across multiple related
+tickets), Notion pages (use the `/notion` skill/slash-command to fetch them),
+Figma links (the Figma MCP is connected — use it to inspect designs/frames
+directly), Slack message links (the Slack MCP is connected — use it to fetch
+the actual message/thread content, not just a raw URL fetch), or other links.
+
+If any such references exist:
+1. Read every one of them FULLY before starting implementation. They often
+   contain decisions, constraints, or context essential to doing this right
+   — do not skip past them or skim.
+2. Any local `.md` file referenced this way is almost certainly shared by
+   OTHER tickets too (a whole epic's worth of context can live in one doc).
+   Treat it as a living document, not this ticket's private scratch space.
+3. When you learn something new, make a decision, or finish a step that
+   future readers (you on a later ticket, a human, or another agent) would
+   need to know — APPEND it to the relevant file, in a clearly dated/labeled
+   section. Never overwrite or delete existing content, never rewrite
+   history, only add. Follow the file's existing structure/style if it has
+   one (e.g. a "Decisions" table, a dated "## Decisions taken while
+   implementing" section).
+4. If no such references exist in this ticket, skip this section entirely —
+   don't invent one.
+
 Task:
 - Implement the ticket end to end on this branch.
 - Follow the repo's existing conventions (see AGENTS.md/CLAUDE.md if present).

@@ -33,6 +33,59 @@ A ticket is "food" for the pipeline only if it has:
 4. **Project = RND** (or whatever `jql_extra` in config.yaml currently scopes
    pickup to).
 
+## Shared context — "must read" material from your own brainstorming
+
+If you've done research or planning in a **separate, unrelated worktree**
+(your own `.claude-code/` scratch docs — decisions, HLDs, Slack/call
+summaries, handoff notes — the kind that can feed a whole multi-ticket epic,
+not just one ticket), point the agent at it explicitly in the ticket. Don't
+assume it will find these on its own.
+
+**How:** add a section to the ticket description (or a comment), e.g.:
+
+```
+## Context — must read before implementing
+- /Users/talmoskovich/.superset/worktrees/submitter-app-electron/mixed-pig/.claude-code/jxl-highres-upload-decisions.md
+- Notion: <page URL>
+- Figma: <file/frame URL>
+- Slack: <message permalink>
+```
+
+Use **absolute paths** — the agent works from a completely different
+worktree than wherever you wrote the doc, so a relative path resolves to
+nothing.
+
+**What the pipeline does with this (already built into the task prompt, no
+extra setup needed):**
+- The agent is instructed to read every referenced file/link in full before
+  implementing anything.
+- Notion links are fetched via the `/notion` skill. Figma links are fetched
+  via the connected **Figma MCP** — the agent can inspect designs/frames
+  directly. Slack links are fetched via the connected **Slack MCP** — the
+  agent can pull the actual message/thread content, not just a raw URL
+  fetch. All three are live integrations in this Claude Code setup, not
+  best-effort guesses.
+- Local `.md` files referenced this way are treated as **living, shared
+  documents** — the agent appends new decisions/findings to them (in a
+  dated/labeled section, following the file's existing style) rather than
+  treating them as private scratch space. This is exactly the "Decisions
+  taken while implementing" pattern already used in hand-written docs like
+  `jxl-highres-upload-decisions.md` — the pipeline just continues that
+  pattern automatically, across however many tickets share the same file.
+  Existing content is never overwritten or rewritten, only appended to.
+- The same instruction applies during the review-feedback rework loop (see
+  below) — the agent re-checks referenced context if relevant to the
+  feedback and keeps appending to it.
+
+**Why this stays safe automatically:** these `.claude-code/` scratch docs
+live in *other* worktree tooling (e.g. `.superset/worktrees/...`), completely
+outside `worktree_root` in `config.yaml` (`~/jira-claude-pipeline/worktrees/`
+by default). The pipeline's cleanup step only ever deletes worktrees it
+created itself, tracked by exact path in its own state DB — it has no way to
+reach, and never touches, a worktree from a different tool. No extra
+guardrail is needed as long as your brainstorm docs stay outside
+`worktree_root`.
+
 If a ticket is inherently ambiguous (a product decision, a design choice with
 no clear default), still tag it `aidev` — the pipeline instructs Claude to
 print `AIDEV_NEEDS_INPUT: <question>` and post it as a Jira comment instead of
