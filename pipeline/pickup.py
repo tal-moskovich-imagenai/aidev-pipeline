@@ -25,13 +25,26 @@ def log(msg):
     print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}")
 
 
+SOUL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "SOUL.md")
+
+
+def load_soul():
+    try:
+        with open(SOUL_PATH) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
 def build_task_prompt(issue):
     key = issue["key"]
     summary = issue["fields"]["summary"]
     desc = jira_client.plain_description(issue)
     cfg = config.load()
     steps = "\n".join(f"{i+1}. Run the slash command: {s}" for i, s in enumerate(cfg["claude"]["post_steps"]))
-    return f"""You are working on Jira ticket {key}: {summary}
+    soul = load_soul()
+    soul_section = f"\n---\n{soul}\n---\n\n" if soul else ""
+    return f"""{soul_section}You are working on Jira ticket {key}: {summary}
 
 Description:
 {desc or '(no description provided)'}
