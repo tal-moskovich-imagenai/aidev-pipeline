@@ -70,13 +70,13 @@ def pickup_ticket(issue):
     key = issue["key"]
     if state.get(key):
         log(f"{key}: already tracked, skipping")
-        return
+        return False
 
     blockers = jira_client.get_blocking_issues(key)
     if blockers:
         blocker_list = ", ".join(f"{k} ({s})" for k, s in blockers)
         log(f"{key}: blocked by {blocker_list} — skipping")
-        return
+        return False
 
     labels = issue["fields"].get("labels", [])
     repo_path = config.repo_for(labels)
@@ -94,7 +94,6 @@ def pickup_ticket(issue):
     # If branch/worktree already exists from a previous failed attempt, reuse it.
     if not os.path.isdir(worktree_path):
         raise RuntimeError(f"{key}: failed to create worktree at {worktree_path}")
-
     if procs.tmux_session_exists(tmux_name):
         procs.tmux_kill(tmux_name)
     procs.tmux_new_session(tmux_name)
@@ -134,6 +133,7 @@ def pickup_ticket(issue):
         log(f"{key}: label warning: {e}")
 
     log(f"{key}: launched, session {session_id}")
+    return True
 
 
 def main():
@@ -147,6 +147,18 @@ def main():
 def _run():
     cfg = config.load()
     jcfg = cfg["jira"]
+    max_concurrent = cfg["claude"].get("max_concurrent")
+
+    if max_concurrent:
+        active = state.count_active()
+        free_slots = max_concurrent - active
+        log(f"Concurrency: {active}/{max_concurrent} slots occupied, {max(0, free_slots)} free")
+        if free_slots <= 0:
+            log("No free slots — skipping pickup this run")
+            return
+    else:
+        free_slots = None
+
     jql = f'labels = "{jcfg["label"]}" AND status = "{jcfg["todo_status"]}"'
     if jcfg.get("jql_extra"):
         jql += f" AND {jcfg['jql_extra']}"
@@ -155,9 +167,15 @@ def _run():
     issues = jira_client.search_issues(jql)
     log(f"Found {len(issues)} ticket(s) to pick up")
 
+    picked_up = 0
     for issue in issues:
+        if free_slots is not None and picked_up >= free_slots:
+            remaining = len(issues) - picked_up
+            log(f"Concurrency cap reached — deferring {remaining} remaining ticket(s) to next run")
+            break
         try:
-            pickup_ticket(issue)
+            if pickup_ticket(issue):
+                picked_up += 1
         except Exception as e:
             log(f"ERROR handling {issue.get('key')}: {e}")
 

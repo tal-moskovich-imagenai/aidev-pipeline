@@ -25,6 +25,9 @@ claude:
   idle_poll_interval: 8
   max_wait_seconds: 5400                 # hard cap per postprocess stage (90 min)
   max_running_hours: 6                   # ticket marked FAILED if still RUNNING/STUCK past this
+  max_concurrent: 3                      # cap on tickets occupying a Claude Code slot at once
+                                          # (RUNNING/STUCK/POSTPROCESS/PR_OPENED/DONE); extras wait
+                                          # for a slot to free up on the next pickup.py run
 
 pr:
   open_pr: true

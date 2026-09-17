@@ -50,6 +50,40 @@ def all_in_state(state):
         return [dict(r) for r in rows]
 
 
+ACTIVE_STATES = ("NEW", "RUNNING", "STUCK", "POSTPROCESS", "PR_OPENED", "DONE")
+CLEANUP_CANDIDATE_STATES = ("RUNNING", "STUCK", "POSTPROCESS", "PR_OPENED", "DONE", "FAILED")
+
+
+def count_active():
+    """Tickets currently occupying a Claude Code slot (not yet archived or
+    permanently failed). Used to cap concurrent pickups."""
+    with db() as conn:
+        placeholders = ",".join("?" * len(ACTIVE_STATES))
+        row = conn.execute(
+            f"SELECT COUNT(*) as c FROM tickets WHERE state IN ({placeholders})", ACTIVE_STATES
+        ).fetchone()
+        return row["c"]
+
+
+def all_cleanup_candidates():
+    """Tickets whose worktree may still exist on disk — checked against Jira
+    each run to see if they've reached a terminal status and can be archived."""
+    with db() as conn:
+        placeholders = ",".join("?" * len(CLEANUP_CANDIDATE_STATES))
+        rows = conn.execute(
+            f"SELECT * FROM tickets WHERE state IN ({placeholders})", CLEANUP_CANDIDATE_STATES
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_archived(ticket_key):
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET state = 'ARCHIVED', updated_at = datetime('now') WHERE ticket_key = ?",
+            (ticket_key,),
+        )
+
+
 def insert(ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state="NEW"):
     with db() as conn:
         conn.execute(

@@ -81,7 +81,21 @@ of the tmux pane, so you can resume from anywhere, anytime.
 ## State machine
 
 `NEW → RUNNING → (STUCK ↔ RUNNING)* → POSTPROCESS → PR_OPENED → DONE` (or
-`FAILED`), tracked in `state/aidev.sqlite3`.
+`FAILED`), tracked in `state/aidev.sqlite3`. `DONE`/`FAILED` tickets are
+checked every `monitor.py` run against their live Jira status; once that
+status reaches Done/Rejected/Cancelled/Closed (a human call, never the
+pipeline's), the worktree and local branch are deleted and the ticket moves
+to `ARCHIVED` — this keeps disk usage bounded across weeks of tickets instead
+of growing forever.
+
+## Concurrency cap
+
+`claude.max_concurrent` in `config.yaml` caps how many tickets can occupy a
+Claude Code slot at once (`RUNNING`/`STUCK`/`POSTPROCESS`/`PR_OPENED`/`DONE`
+all count — `ARCHIVED`/`FAILED` don't). If more `aidev`-labeled tickets are
+waiting than there's room for, `pickup.py` picks up only as many as fit and
+logs how many it deferred to a later run. Tagging 10 tickets at once won't
+launch 10 parallel Claude Code sessions competing for your Mac's resources.
 
 ## Dependency chains between tickets
 

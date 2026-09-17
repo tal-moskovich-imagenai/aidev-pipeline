@@ -342,6 +342,52 @@ def process_done_ticket(ticket):
     notify(f"aidev: {key} rework started", feedback[:200])
 
 
+def cleanup_worktree(ticket):
+    """Removes the git worktree and local branch for a ticket. Safe to call
+    even if the worktree is already gone. Never touches the remote branch —
+    that's GitHub's PR-merge cleanup, not ours."""
+    key = ticket["ticket_key"]
+    repo_path = ticket["repo_path"]
+    worktree_path = ticket["worktree_path"]
+    branch = ticket["branch"]
+    tmux_name = ticket["tmux_session"]
+
+    procs.tmux_kill(tmux_name)
+
+    if os.path.isdir(worktree_path):
+        result = procs.sh(f"git worktree remove {procs.shlex.quote(worktree_path)} --force", cwd=repo_path, check=False)
+        log(f"{key}: removed worktree at {worktree_path}")
+    else:
+        log(f"{key}: worktree already gone at {worktree_path}")
+
+    procs.sh(f"git branch -D {procs.shlex.quote(branch)}", cwd=repo_path, check=False)
+    procs.sh("git worktree prune", cwd=repo_path, check=False)
+
+
+TERMINAL_JIRA_STATUSES = ("done", "rejected", "cancelled", "closed")
+
+
+def process_cleanup_candidate(ticket):
+    """Checks whether a tracked ticket has reached a terminal Jira status
+    (Done/Rejected/etc, set by a human — the pipeline never sets these) and,
+    if so, removes its worktree/branch and archives it in the state DB so
+    disk usage doesn't grow unbounded across weeks of tickets."""
+    key = ticket["ticket_key"]
+    try:
+        issue = jira_client.get_issue(key, fields=["status"])
+    except Exception as e:
+        log(f"{key}: could not check status for cleanup: {e}")
+        return
+
+    status_name = issue["fields"]["status"]["name"]
+    if status_name.lower() not in TERMINAL_JIRA_STATUSES:
+        return
+
+    log(f"{key}: Jira status is '{status_name}' — cleaning up worktree and archiving")
+    cleanup_worktree(ticket)
+    state.set_archived(key)
+
+
 def main():
     try:
         with lockfile.Lock("monitor"):
@@ -374,6 +420,14 @@ def _run():
             process_done_ticket(ticket)
         except Exception as e:
             log(f"ERROR processing done {ticket['ticket_key']}: {e}")
+
+    candidates = state.all_cleanup_candidates()
+    log(f"Checking {len(candidates)} ticket(s) for worktree cleanup (terminal Jira status)")
+    for ticket in candidates:
+        try:
+            process_cleanup_candidate(ticket)
+        except Exception as e:
+            log(f"ERROR cleaning up {ticket['ticket_key']}: {e}")
 
 
 if __name__ == "__main__":
