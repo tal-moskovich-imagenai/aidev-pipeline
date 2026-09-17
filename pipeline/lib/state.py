@@ -1,5 +1,6 @@
 import sqlite3
 import contextlib
+from datetime import datetime
 from . import config
 
 SCHEMA = """
@@ -14,6 +15,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     pr_url           TEXT,
     stuck_question   TEXT,
     last_comment_id  TEXT,
+    running_since    TEXT,
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
@@ -51,8 +53,8 @@ def all_in_state(state):
 def insert(ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state="NEW"):
     with db() as conn:
         conn.execute(
-            "INSERT INTO tickets (ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tickets (ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state, running_since) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
             (ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state),
         )
 
@@ -82,7 +84,8 @@ def set_stuck(ticket_key, question):
 def clear_stuck(ticket_key):
     with db() as conn:
         conn.execute(
-            "UPDATE tickets SET state = 'RUNNING', stuck_question = NULL, updated_at = datetime('now') WHERE ticket_key = ?",
+            "UPDATE tickets SET state = 'RUNNING', stuck_question = NULL, running_since = datetime('now'), "
+            "updated_at = datetime('now') WHERE ticket_key = ?",
             (ticket_key,),
         )
 
@@ -101,3 +104,17 @@ def _migrate(conn):
         conn.execute("ALTER TABLE tickets ADD COLUMN stuck_question TEXT")
     if "last_comment_id" not in cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN last_comment_id TEXT")
+    if "running_since" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN running_since TEXT")
+
+
+def seconds_running(ticket):
+    """Returns elapsed seconds since running_since, or None if unset/unparseable."""
+    running_since = ticket.get("running_since")
+    if not running_since:
+        return None
+    try:
+        started = datetime.strptime(running_since, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return (datetime.utcnow() - started).total_seconds()

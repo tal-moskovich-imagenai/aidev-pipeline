@@ -23,7 +23,8 @@ claude:
     - "/custom-review"
   idle_seconds: 20                       # pane must be unchanged this long to be considered "idle"
   idle_poll_interval: 8
-  max_wait_seconds: 5400                 # hard cap per stage (90 min)
+  max_wait_seconds: 5400                 # hard cap per postprocess stage (90 min)
+  max_running_hours: 6                   # ticket marked FAILED if still RUNNING/STUCK past this
 
 pr:
   open_pr: true

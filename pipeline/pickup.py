@@ -11,18 +11,26 @@ import os
 import re
 import sys
 import uuid
-import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib import config, jira_client, state, procs
+from lib import config, jira_client, state, procs, lockfile
+from lib.pipelog import get_logger
+
+log = get_logger("pickup")
 
 
 def slugify(key):
     return re.sub(r"[^a-zA-Z0-9_-]", "-", key)
 
 
-def log(msg):
-    print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}")
+def mark_failed(key, reason):
+    log(f"{key}: FAILED — {reason}")
+    state.set_state(key, "FAILED")
+    try:
+        jira_client.add_comment(key, f"[aidev] Marked as failed: {reason}")
+        jira_client.set_state_label(key, "aidev-stuck")
+    except Exception as e:
+        log(f"{key}: could not post failure comment: {e}")
 
 
 SOUL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "SOUL.md")
@@ -141,6 +149,14 @@ def pickup_ticket(issue):
 
 
 def main():
+    try:
+        with lockfile.Lock("pickup"):
+            _run()
+    except lockfile.LockHeld as e:
+        log(f"skip run: {e}")
+
+
+def _run():
     cfg = config.load()
     jcfg = cfg["jira"]
     jql = f'labels = "{jcfg["label"]}" AND status = "{jcfg["todo_status"]}"'

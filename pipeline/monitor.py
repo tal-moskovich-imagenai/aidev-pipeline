@@ -14,17 +14,16 @@ Run this from cron (e.g. every 2-3 minutes), separate from pickup.py.
 import os
 import re
 import sys
-import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib import config, jira_client, state, procs
+from lib import config, jira_client, state, procs, lockfile
+from lib.pipelog import get_logger
+from lib.notify import notify
+
+log = get_logger("monitor")
 
 COMPLETE_RE = re.compile(r"⏺\s*AIDEV_TASK_COMPLETE")
 NEEDS_INPUT_RE = re.compile(r"⏺\s*AIDEV_NEEDS_INPUT:\s*(.+)")
-
-
-def log(msg):
-    print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}")
 
 
 def is_complete(pane):
@@ -68,14 +67,36 @@ def open_pr(ticket):
     return pr_url, pr_out
 
 
+def mark_failed(key, reason, tmux_name=None):
+    log(f"{key}: FAILED — {reason}")
+    state.set_state(key, "FAILED")
+    try:
+        jira_client.add_comment(key, f"[aidev] Marked as failed: {reason}")
+        jira_client.set_state_label(key, "aidev-stuck")
+    except Exception as e:
+        log(f"{key}: could not post failure comment: {e}")
+    if tmux_name:
+        procs.tmux_kill(tmux_name)
+    notify(f"aidev: {key} failed", reason)
+
+
 def process_running_ticket(ticket):
     cfg = config.load()
     key = ticket["ticket_key"]
     tmux_name = ticket["tmux_session"]
+    max_hours = cfg["claude"].get("max_running_hours")
 
     if not procs.tmux_session_exists(tmux_name):
-        log(f"{key}: tmux session gone while RUNNING — marking FAILED")
-        state.set_state(key, "FAILED")
+        mark_failed(key, "tmux session disappeared while RUNNING (crash, reboot, or manual kill)")
+        return
+
+    elapsed = state.seconds_running(ticket)
+    if max_hours and elapsed and elapsed > max_hours * 3600:
+        mark_failed(
+            key,
+            f"exceeded max_running_hours ({max_hours}h) — likely stuck in a loop or blocked silently",
+            tmux_name=tmux_name,
+        )
         return
 
     pane = procs.tmux_capture(tmux_name, lines=300)
@@ -104,6 +125,7 @@ def process_running_ticket(ticket):
             jira_client.set_state_label(key, "aidev-stuck")
         except Exception as e:
             log(f"{key}: could not post stuck comment: {e}")
+        notify(f"aidev: {key} needs input", question)
         return
 
     log(f"{key}: still running")
@@ -119,9 +141,7 @@ def finish_ticket(ticket):
     try:
         pr_url, pr_out = open_pr(ticket)
     except Exception as e:
-        log(f"{key}: PR step failed: {e}")
-        jira_client.add_comment(key, f"aidev: PR step failed: {e}")
-        state.set_state(key, "FAILED")
+        mark_failed(key, f"PR step failed: {e}")
         return
 
     state.set_state(key, "PR_OPENED", pr_url=pr_url)
@@ -147,15 +167,26 @@ def finish_ticket(ticket):
     state.set_state(key, "DONE", pr_url=pr_url)
     procs.tmux_kill(tmux_name)
     log(f"{key}: done")
+    notify(f"aidev: {key} done", pr_url or "PR step had no URL — check comment")
 
 
 def process_stuck_ticket(ticket):
+    cfg = config.load()
     key = ticket["ticket_key"]
     tmux_name = ticket["tmux_session"]
+    max_hours = cfg["claude"].get("max_running_hours")
 
     if not procs.tmux_session_exists(tmux_name):
-        log(f"{key}: tmux session gone while STUCK — marking FAILED")
-        state.set_state(key, "FAILED")
+        mark_failed(key, "tmux session disappeared while STUCK (crash, reboot, or manual kill)")
+        return
+
+    elapsed = state.seconds_running(ticket)
+    if max_hours and elapsed and elapsed > max_hours * 3600:
+        mark_failed(
+            key,
+            f"stuck waiting for a reply past max_running_hours ({max_hours}h) with no response",
+            tmux_name=tmux_name,
+        )
         return
 
     try:
@@ -188,6 +219,14 @@ def process_stuck_ticket(ticket):
 
 
 def main():
+    try:
+        with lockfile.Lock("monitor"):
+            _run()
+    except lockfile.LockHeld as e:
+        log(f"skip run: {e}")
+
+
+def _run():
     running = state.all_in_state("RUNNING")
     log(f"Checking {len(running)} running ticket(s)")
     for ticket in running:
