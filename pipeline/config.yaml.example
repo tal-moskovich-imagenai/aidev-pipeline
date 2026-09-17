@@ -1,0 +1,33 @@
+jira:
+  base_url: "https://imagen-ai.atlassian.net"
+  email: "tal.m@imagen-ai.com"
+  keychain_service: "aidev-jira-token"   # security add-generic-password -a <email> -s aidev-jira-token -w <token>
+  label: "aidev"                         # tag that marks a ticket for automated pickup
+  todo_status: "New"                     # matches this Jira instance's board
+  in_progress_status: "In Progress"      # status to move ticket to once Claude starts
+  review_status: "In Review"             # status to move ticket to once PR is opened
+  jql_extra: "project = RND"             # scope pickup to the RND project
+
+repos:
+  default: "/Users/talmoskovich/Documents/GitHub/submitter-app-electron"
+  # add more "REPOKEY: /path/to/repo" here; a ticket can specify which repo via
+  # a Jira label like "repo:REPOKEY", otherwise "default" is used.
+
+worktree_root: "/Users/talmoskovich/jira-claude-pipeline/worktrees"
+
+claude:
+  dangerously_skip_permissions: true
+  post_steps:                            # slash commands run in-session after the main task, in order
+    - "/simplify"
+    - "/custom-simplify"
+    - "/custom-review"
+  idle_seconds: 20                       # pane must be unchanged this long to be considered "idle"
+  idle_poll_interval: 8
+  max_wait_seconds: 5400                 # hard cap per stage (90 min)
+
+pr:
+  open_pr: true
+  base_branch: "master"
+
+state_db: "/Users/talmoskovich/jira-claude-pipeline/state/aidev.sqlite3"
+log_dir: "/Users/talmoskovich/jira-claude-pipeline/logs"
