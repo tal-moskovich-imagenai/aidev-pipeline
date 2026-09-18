@@ -179,6 +179,48 @@ retried on the next poll. As soon as the blocking ticket's status flips to a
 terminal state, the next `pickup.py` run picks up the now-unblocked ticket
 automatically. No manual intervention needed.
 
+### Stacking on a blocker that's only In Review (not merged yet)
+
+`stack_on_review: true` in `config.yaml` (on by default) lets the pipeline
+proceed on a ticket as soon as its blocker reaches `review_status` (e.g.
+"In Review") — it does not wait for the blocker to actually merge. This
+mirrors what you'd do by hand: build PR N+1 on top of PR N before N lands,
+rather than blocking your whole day on someone else's review turnaround.
+
+**What happens:** the new ticket's worktree branches off the blocker's
+branch (`git worktree add ... -b <new> <blocker-branch>`), not off
+`master`/`main`. Its eventual PR is opened with the blocker's branch as the
+base, not `master` — same shape as manually chaining `gh pr create --base
+<other-pr-branch>`. The agent is told explicitly in its task prompt that it's
+on a stacked branch and that the blocker's changes being present in the diff
+is expected, not a mistake to undo.
+
+**Requirements for stacking to actually trigger:**
+- The blocker must have been picked up **by this same pipeline instance**
+  (its branch is looked up from the pipeline's own state DB, not guessed).
+  A ticket you built manually, or one another pipeline instance/repo picked
+  up, has no recorded branch here — the dependent ticket is skipped with a
+  clear log line (`blocker X is In Review but not tracked locally`) rather
+  than guessing at a branch name.
+- Only one soft (In-Review) blocker is supported per ticket. A ticket with
+  two or more open blockers, even if all are In Review, is skipped until
+  it's down to at most one.
+- A **hard** blocker (any status other than terminal or `review_status`)
+  still blocks unconditionally — stacking only changes the "In Review isn't
+  merged yet" case, not "still New"/"In Progress" ones.
+
+**Consequence you must handle manually:** a stacked PR is not runnable in
+isolation — it needs its base to merge (or be rebased onto whatever actually
+lands) before it can go into `master`. Once the base PR merges, rebase the
+stacked one yourself; the pipeline does not automate this. If the base
+ticket's review produces changes, they land on the base branch and the
+stacked PR's diff stays layered on top — same as any manual PR stack.
+
+**When to leave this off:** if your team prefers each PR to be independently
+mergeable, or blockers routinely change enough during review that stacking
+would mean constant rebasing, set `stack_on_review: false` and let tickets
+wait for a real merge like before.
+
 **Practical rules for a sequenced epic:**
 - Tag ALL tickets in the chain `aidev` up front — don't wait to tag ticket 2
   until ticket 1 finishes. The pipeline will simply skip blocked ones.
