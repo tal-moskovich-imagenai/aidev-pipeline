@@ -5,6 +5,9 @@ Jira → Claude Code autonomous development pipeline. Tag a Jira ticket
 (implement → review → commit → PR), and reports back on the ticket —
 including asking for clarification via Jira comments when genuinely stuck.
 
+**Current status on this machine:** running unattended via Hermes cron (see
+"Scheduling" below) — `pickup.py` every 5 min, `monitor.py` every 3 min.
+
 ## Repo layout
 
 ```
@@ -14,6 +17,11 @@ pipeline/               the actual orchestrator (Python, stdlib-only + PyYAML)
     jira_client.py      Jira Cloud REST v3 client (urllib, Basic auth via Keychain)
     state.py             SQLite ticket-tracking state machine
     procs.py             tmux + shell helpers
+    github.py            gh pr lookup fallback for stacking on manually-built blockers
+    lockfile.py           PID lock so pickup.py/monitor.py never overlap
+    pipelog.py             stdout + dated file logging
+    notify.py               macOS + optional Slack notifications
+    soul.py                   loads SOUL.md into every task prompt
   pickup.py              polls Jira, launches worktree + tmux + Claude Code session
   monitor.py              watches running/stuck sessions, opens PRs, relays replies
   status.py               CLI status table
@@ -67,6 +75,31 @@ Two independent loops, meant to run on a schedule (cron):
 Suggested cadence: pickup.py every 5 min, monitor.py every 2-3 min.
 
 `python3 status.py` — quick table of all tracked tickets and their state.
+
+## Scheduling
+
+**macOS `cron` requires Full Disk Access and silently fails without it** —
+confirmed on this machine (`Operation not permitted` reading the scripts,
+zero indication in `crontab` itself that anything is wrong). Rather than
+grant that, this deployment uses **Hermes's own cron scheduler**
+(`cronjob_manage`), which runs as a normal user process and isn't subject to
+the same TCC restriction:
+
+```bash
+# wrapper scripts, referenced by filename only from ~/.hermes/scripts/
+~/.hermes/scripts/aidev-pickup.sh    # cd + python3 pickup.py
+~/.hermes/scripts/aidev-monitor.sh   # cd + python3 monitor.py
+```
+
+Both are registered as `no_agent: true` jobs (pure script execution, no LLM
+call) named `aidev-pickup` (`*/5 * * * *`) and `aidev-monitor`
+(`*/3 * * * *`), `deliver: local` (no chat/notification spam per run — the
+pipeline's own `notify()` handles that separately for stuck/done/failed).
+
+If you ever move this to a plain `cron`/`launchd` setup instead, remember
+the Full Disk Access step for `/usr/sbin/cron` first (System Settings →
+Privacy & Security → Full Disk Access → add `/usr/sbin/cron`), or jobs will
+appear scheduled but never actually run.
 
 ## Manual intervention
 

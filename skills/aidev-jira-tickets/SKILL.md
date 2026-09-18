@@ -196,12 +196,17 @@ on a stacked branch and that the blocker's changes being present in the diff
 is expected, not a mistake to undo.
 
 **Requirements for stacking to actually trigger:**
-- The blocker must have been picked up **by this same pipeline instance**
-  (its branch is looked up from the pipeline's own state DB, not guessed).
-  A ticket you built manually, or one another pipeline instance/repo picked
-  up, has no recorded branch here — the dependent ticket is skipped with a
-  clear log line (`blocker X is In Review but not tracked locally`) rather
-  than guessing at a branch name.
+- The blocker's branch is resolved two ways, in order:
+  1. **The pipeline's own state DB** — exact, if this same pipeline instance
+     picked up the blocker.
+  2. **Fallback: `gh pr list --search "<blocker-key> in:title" --state
+     open`** — used when the blocker isn't tracked locally (built manually,
+     or by a different pipeline instance/repo). This only works if the
+     blocker's PR title contains its Jira key (the existing convention
+     already used by `pickup.py`'s own PR titles, and by hand-built PRs like
+     `... (RND-14726)`). If that search returns anything other than exactly
+     one open PR, stacking is refused rather than guessed — logged clearly
+     either way (`found via gh pr list` vs `no unambiguous open PR found`).
 - Only one soft (In-Review) blocker is supported per ticket. A ticket with
   two or more open blockers, even if all are In Review, is skipped until
   it's down to at most one.
