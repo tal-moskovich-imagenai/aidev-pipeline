@@ -56,23 +56,39 @@ def get_issue(key, fields=None):
     return _request("GET", f"/rest/api/3/issue/{key}", params={"fields": ",".join(fields)})
 
 
-def get_blocking_issues(key):
-    """Returns [(blocker_key, blocker_status_name), ...] for issues that block `key`
-    and are not yet Done/Rejected (i.e. still actively blocking)."""
+def get_blocking_issues(key, review_status=None):
+    """Returns [(blocker_key, blocker_status_name, hard), ...] for issues
+    that block `key` and are not yet in a terminal status.
+
+    `hard=True` means the blocker has not yet reached `review_status` (or no
+    review_status was given) — the ticket must wait, full stop.
+    `hard=False` means the blocker is sitting exactly at `review_status`
+    (e.g. "In Review") — not merged yet, but far enough along that a caller
+    may choose to proceed by stacking a new branch on top of the blocker's
+    own branch instead of waiting for it to reach a terminal status.
+    """
     issue = get_issue(key, fields=["issuelinks"])
     blockers = []
     for link in issue["fields"].get("issuelinks", []):
-        link_type = link.get("type", {})
-        # When the fetched issue is on the "inward" side of a Blocks link
-        # (i.e. "is blocked by"), Jira puts the blocking issue under outwardIssue.
-        if link_type.get("inward") != "is blocked by":
+        if link.get("type", {}).get("name") != "Blocks":
             continue
-        blocker = link.get("outwardIssue")
+        # Jira's issuelinks payload for issue X never includes X itself —
+        # it includes only the OTHER side of the link, under whichever key
+        # ("inwardIssue" or "outwardIssue") X is NOT. Verified directly
+        # against JQL linkedIssues(..., "is blocked by"): when the link on X
+        # carries an "inwardIssue", that inwardIssue is the one blocking X.
+        # When it carries an "outwardIssue" instead, X is not blocked by it
+        # (X may block that other issue, but that's not a blocker of X).
+        blocker = link.get("inwardIssue")
         if not blocker:
             continue
         status_name = blocker["fields"]["status"]["name"]
-        if status_name.lower() not in ("done", "rejected", "cancelled", "closed"):
-            blockers.append((blocker["key"], status_name))
+        if status_name.lower() in ("done", "rejected", "cancelled", "closed"):
+            continue  # terminal — not a blocker at all
+        hard = True
+        if review_status and status_name.lower() == review_status.lower():
+            hard = False
+        blockers.append((blocker["key"], status_name, hard))
     return blockers
 
 

@@ -28,6 +28,9 @@ claude:
   max_concurrent: 3                      # cap on tickets occupying a Claude Code slot at once
                                           # (RUNNING/STUCK/POSTPROCESS/PR_OPENED/DONE); extras wait
                                           # for a slot to free up on the next pickup.py run
+  stack_on_review: true                  # if a blocker is sitting at review_status (not merged),
+                                          # branch the next ticket off the blocker's own branch
+                                          # instead of waiting for it to merge (stacked PRs)
 
 pr:
   open_pr: true

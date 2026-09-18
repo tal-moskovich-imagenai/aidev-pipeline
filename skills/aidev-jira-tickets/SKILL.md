@@ -35,17 +35,18 @@ A ticket is "food" for the pipeline only if it has:
 
 ## Shared context — "must read" material from your own brainstorming
 
-If you've done research or planning in a **separate, unrelated worktree**
-(your own `.claude-code/` scratch docs — decisions, HLDs, Slack/call
-summaries, handoff notes — the kind that can feed a whole multi-ticket epic,
-not just one ticket), point the agent at it explicitly in the ticket. Don't
-assume it will find these on its own.
+If you've done research or planning outside the ticket — your own
+`.claude-code/` scratch docs, decisions logs, HLDs, Slack/call summaries,
+handoff notes, the kind that can feed a whole multi-ticket epic rather than
+one ticket — point the agent at it explicitly. Don't assume it will find
+these on its own.
 
 **How:** add a section to the ticket description (or a comment), e.g.:
 
 ```
 ## Context — must read before implementing
-- /Users/talmoskovich/.superset/worktrees/submitter-app-electron/mixed-pig/.claude-code/jxl-highres-upload-decisions.md
+- /Users/talmoskovich/Documents/GitHub/<repo>/.claude-code/<epic>-decisions.md
+- /tmp/<epic>-handoff.md
 - Notion: <page URL>
 - Figma: <file/frame URL>
 - Slack: <message permalink>
@@ -54,6 +55,35 @@ assume it will find these on its own.
 Use **absolute paths** — the agent works from a completely different
 worktree than wherever you wrote the doc, so a relative path resolves to
 nothing.
+
+**Any absolute path on this machine works**, including `/tmp` and paths under
+`~/.superset/worktrees/...`. The agent reads the filesystem directly; it is
+not restricted to its own worktree.
+
+**It reads exactly the paths the ticket lists — it does not scan directories.**
+Putting a doc in `/tmp` (or anywhere else) does nothing on its own; if it isn't
+named in the ticket description or a comment, the agent will never open it.
+List each file you want read, one per line. A directory path on its own is not
+a reference.
+
+**Where to put it, in order of preference:**
+
+1. **The main checkout's `.claude-code/`** (e.g.
+   `/Users/talmoskovich/Documents/GitHub/submitter-app-electron/.claude-code/`)
+   — the durable choice for anything a multi-ticket epic depends on.
+   `.claude-code/` is gitignored, so it never leaks into the pipeline's
+   worktrees, and the main checkout is not itself ephemeral.
+2. **`/tmp`** — fine, and the right home for genuinely short-lived handoffs.
+   Note macOS prunes `/tmp` entries untouched for ~3 days and clears it on
+   reboot, so don't park the only copy of an epic's context there if the
+   epic will run for weeks.
+3. **Another tool's worktree** (`~/.superset/worktrees/<repo>/<name>/...`) —
+   works, but that worktree can be cleaned up by the tool that made it,
+   which silently breaks every ticket referencing it. Prefer (1) for
+   anything long-lived.
+
+Whichever you pick, it must stay **outside `worktree_root`** in
+`config.yaml` — see the safety note below.
 
 **What the pipeline does with this (already built into the task prompt, no
 extra setup needed):**
@@ -77,14 +107,21 @@ extra setup needed):**
   below) — the agent re-checks referenced context if relevant to the
   feedback and keeps appending to it.
 
-**Why this stays safe automatically:** these `.claude-code/` scratch docs
-live in *other* worktree tooling (e.g. `.superset/worktrees/...`), completely
-outside `worktree_root` in `config.yaml` (`~/jira-claude-pipeline/worktrees/`
-by default). The pipeline's cleanup step only ever deletes worktrees it
-created itself, tracked by exact path in its own state DB — it has no way to
-reach, and never touches, a worktree from a different tool. No extra
-guardrail is needed as long as your brainstorm docs stay outside
-`worktree_root`.
+**Why this stays safe automatically:** every location recommended above —
+the main checkout's `.claude-code/`, `/tmp`, another tool's worktree — sits
+completely outside `worktree_root` in `config.yaml`
+(`~/jira-claude-pipeline/worktrees/` by default). The pipeline's cleanup step
+only ever deletes worktrees it created itself, tracked by exact path in its
+own state DB; it has no way to reach anything else. No extra guardrail is
+needed as long as your context docs stay outside `worktree_root`.
+
+The one thing to avoid is putting them *inside* `worktree_root` — that is the
+only directory the pipeline deletes from.
+
+Note that the main checkout's `.claude-code/` is gitignored, so it is present
+on disk at that absolute path but **never** appears inside a pipeline
+worktree. That is why the absolute path is required rather than a
+repo-relative one, even for a doc that lives in the same repo.
 
 If a ticket is inherently ambiguous (a product decision, a design choice with
 no clear default), still tag it `aidev` — the pipeline instructs Claude to
@@ -102,6 +139,37 @@ invent a custom label or comment convention for this.
 
 **How to link:** On ticket 2, add an issue link: "is blocked by" → ticket 1.
 (Equivalently: on ticket 1, "blocks" → ticket 2.)
+
+### Creating the link over the API — get the direction right
+
+Doing this in the Jira UI is unambiguous. Doing it over the REST API is a trap
+that has already inverted a whole epic's chain. To say **"X is blocked by B"**:
+
+```json
+POST /rest/api/3/issueLink
+{"type": {"name": "Blocks"},
+ "inwardIssue":  {"key": "B"},     // the BLOCKER
+ "outwardIssue": {"key": "X"}}     // the ticket that WAITS
+```
+
+**Verify with JQL. Never by reading the link JSON back.**
+
+Which key lands under `inwardIssue` vs `outwardIssue` in a *response* depends
+on which issue you fetched, so inspecting the fields is self-confirming — it
+agrees just as readily with a backwards link as a correct one. Two separate
+"corrections" were made on 2026-09-18 on the strength of field-reading, both
+wrong, before JQL settled it.
+
+```
+issue in linkedIssues("X", "is blocked by")   -> must return B
+issue in linkedIssues("X", "blocks")          -> must NOT return B
+```
+
+Run both. The second one catches an inverted link that the first can miss.
+
+A silently inverted chain is expensive: the pipeline runs the epic **backwards**,
+picking up the last ticket first, and every agent then finds none of its
+foundation in master.
 
 **Why this and not something else:** the pipeline's `pickup.py` calls
 `jira_client.get_blocking_issues(key)` before touching any ticket. If it

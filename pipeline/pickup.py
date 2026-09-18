@@ -34,14 +34,27 @@ def mark_failed(key, reason):
         log(f"{key}: could not post failure comment: {e}")
 
 
-def build_task_prompt(issue):
+def build_task_prompt(issue, stack_base_key=None):
     key = issue["key"]
     summary = issue["fields"]["summary"]
     desc = jira_client.plain_description(issue)
     cfg = config.load()
     steps = "\n".join(f"{i+1}. Run the slash command: {s}" for i, s in enumerate(cfg["claude"]["post_steps"]))
-    return f"""{soul_section()}You are working on Jira ticket {key}: {summary}
+    stack_note = ""
+    if stack_base_key:
+        stack_note = f"""
+## Stacked branch — important
 
+This ticket is blocked by {stack_base_key}, which is still In Review (not
+merged yet). Your branch was created ON TOP of {stack_base_key}'s branch, so
+your diff will include {stack_base_key}'s changes until that PR merges — this
+is expected and correct, not a mistake. Do not try to remove or revert
+{stack_base_key}'s changes. When you open your PR, it will show as based on
+{stack_base_key}'s branch; that's normal for a stacked PR and a human will
+rebase once the base merges.
+"""
+    return f"""{soul_section()}You are working on Jira ticket {key}: {summary}
+{stack_note}
 Description:
 {desc or '(no description provided)'}
 
@@ -99,11 +112,37 @@ def pickup_ticket(issue):
         log(f"{key}: already tracked, skipping")
         return False
 
-    blockers = jira_client.get_blocking_issues(key)
-    if blockers:
-        blocker_list = ", ".join(f"{k} ({s})" for k, s in blockers)
+    review_status = cfg["jira"].get("review_status")
+    blockers = jira_client.get_blocking_issues(key, review_status=review_status)
+    hard_blockers = [(k, s) for k, s, hard in blockers if hard]
+    if hard_blockers:
+        blocker_list = ", ".join(f"{k} ({s})" for k, s in hard_blockers)
         log(f"{key}: blocked by {blocker_list} — skipping")
         return False
+
+    # Soft blockers: still open, but sitting at review_status (e.g. "In
+    # Review", not merged). If stacking is enabled, proceed by branching off
+    # the blocker's own branch instead of waiting for it to merge — mirrors
+    # a human building PR N+1 on top of PR N before N lands.
+    soft_blockers = [(k, s) for k, s, hard in blockers if not hard]
+    stack_base_branch = None
+    stack_base_key = None
+    if soft_blockers:
+        if not cfg["claude"].get("stack_on_review"):
+            blocker_list = ", ".join(f"{k} ({s})" for k, s in soft_blockers)
+            log(f"{key}: blocked by {blocker_list} (in review, stacking disabled) — skipping")
+            return False
+        if len(soft_blockers) > 1:
+            log(f"{key}: multiple soft blockers {soft_blockers} — stacking only supports one, skipping")
+            return False
+        stack_base_key, _ = soft_blockers[0]
+        blocker_ticket = state.get(stack_base_key)
+        if not blocker_ticket or not blocker_ticket.get("branch"):
+            log(f"{key}: blocker {stack_base_key} is In Review but not tracked locally (picked up by "
+                f"someone else, or a different repo) — cannot determine its branch, skipping")
+            return False
+        stack_base_branch = blocker_ticket["branch"]
+        log(f"{key}: stacking on {stack_base_key}'s branch {stack_base_branch} (still In Review, not merged)")
 
     labels = issue["fields"].get("labels", [])
     repo_path = config.repo_for(labels)
@@ -116,8 +155,12 @@ def pickup_ticket(issue):
     tmux_name = f"aidev-{slug}"
     session_id = str(uuid.uuid4())
 
-    log(f"{key}: creating worktree at {worktree_path} (branch {branch})")
-    procs.sh(f"git worktree add {worktree_path} -b {branch}", cwd=repo_path, check=False)
+    if stack_base_branch:
+        log(f"{key}: creating worktree at {worktree_path} (branch {branch}, stacked on {stack_base_branch})")
+        procs.sh(f"git worktree add {worktree_path} -b {branch} {stack_base_branch}", cwd=repo_path, check=False)
+    else:
+        log(f"{key}: creating worktree at {worktree_path} (branch {branch})")
+        procs.sh(f"git worktree add {worktree_path} -b {branch}", cwd=repo_path, check=False)
     # If branch/worktree already exists from a previous failed attempt, reuse it.
     if not os.path.isdir(worktree_path):
         raise RuntimeError(f"{key}: failed to create worktree at {worktree_path}")
@@ -125,7 +168,7 @@ def pickup_ticket(issue):
         procs.tmux_kill(tmux_name)
     procs.tmux_new_session(tmux_name)
 
-    prompt = build_task_prompt(issue)
+    prompt = build_task_prompt(issue, stack_base_key=stack_base_key)
     prompt_file = os.path.join(worktree_path, ".aidev_prompt.txt")
     with open(prompt_file, "w") as f:
         f.write(prompt)
@@ -138,13 +181,15 @@ def pickup_ticket(issue):
     )
     procs.tmux_send(tmux_name, claude_cmd)
 
-    state.insert(key, repo_path, worktree_path, branch, session_id, tmux_name, state="RUNNING")
+    state.insert(key, repo_path, worktree_path, branch, session_id, tmux_name, state="RUNNING", stacked_on=stack_base_key)
 
     resume_cmd = f"cd {worktree_path} && claude --resume {session_id}"
+    stack_note = f"\nStacked on: {stack_base_key} (still In Review — this branch will need rebasing once it merges)\n" if stack_base_key else ""
     comment = (
         f"\U0001f916 aidev picked up this ticket.\n"
         f"Worktree: {worktree_path}\n"
         f"Branch: {branch}\n"
+        f"{stack_note}"
         f"Session ID: {session_id}\n"
         f"tmux: tmux attach -t {tmux_name}\n"
         f"Resume yourself: {resume_cmd}\n"
