@@ -38,8 +38,6 @@ def build_task_prompt(issue, stack_base_key=None):
     key = issue["key"]
     summary = issue["fields"]["summary"]
     desc = jira_client.plain_description(issue)
-    cfg = config.load()
-    steps = "\n".join(f"{i+1}. Run the slash command: {s}" for i, s in enumerate(cfg["claude"]["post_steps"]))
     stack_note = ""
     if stack_base_key:
         stack_note = f"""
@@ -88,11 +86,23 @@ If any such references exist:
 Task:
 - Implement the ticket end to end on this branch.
 - Follow the repo's existing conventions (see AGENTS.md/CLAUDE.md if present).
-- When the implementation is complete and working, run these steps in order:
-{steps}
-- Then stage and commit ALL changes with a clear, descriptive commit message
-  that references {key}.
-- Do not push or open a PR yourself; the orchestrator handles that next.
+- When the implementation is complete and working, stage and commit ALL
+  changes with a clear, descriptive commit message that references {key}.
+- Push the branch and open the PR yourself:
+  `git push -u origin <branch>` then
+  `gh pr create --base <the branch you branched from — check git log/CLAUDE.md
+  for a stacked base> --title "..." --body "..."`.
+  Write a REAL title and description from your own understanding of what you
+  built and why — no placeholder like "automated by aidev". Follow this
+  repo's own PR conventions if it has a template. A generic/empty PR
+  description is not acceptable output for this ticket.
+- Do NOT run /simplify, /custom-simplify, or /custom-review yet — those run
+  in a follow-up pass after the PR exists (custom-review needs a real PR to
+  tag and comment on).
+- Do not create `.aidev_prompt.txt` or any other pipeline-internal file in
+  the repo — if you notice one from the orchestrator's tooling already
+  tracked in git, that's a bug; `git rm --cached` it rather than leaving it
+  in your commit.
 
 If at any point you are blocked and need clarification from a human (ambiguous
 requirements, a decision you can't safely make on your own, missing access,
@@ -101,7 +111,8 @@ AIDEV_NEEDS_INPUT: <your question here, one line>
 A human will reply as a comment on the Jira ticket; when the orchestrator
 detects a reply it will paste it into this same session so you can continue.
 
-When you are fully done and have committed, say exactly: AIDEV_TASK_COMPLETE
+When you are fully done — committed, pushed, and the PR is open with a real
+title and description — say exactly: AIDEV_TASK_COMPLETE
 """
 
 
@@ -181,7 +192,8 @@ def pickup_ticket(issue):
     procs.tmux_new_session(tmux_name)
 
     prompt = build_task_prompt(issue, stack_base_key=stack_base_key)
-    prompt_file = os.path.join(worktree_path, ".aidev_prompt.txt")
+    os.makedirs(os.path.join(worktree_path, ".claude-code"), exist_ok=True)
+    prompt_file = os.path.join(worktree_path, ".claude-code", ".aidev_prompt.txt")
     with open(prompt_file, "w") as f:
         f.write(prompt)
 
@@ -189,7 +201,7 @@ def pickup_ticket(issue):
     claude_cmd = (
         f"cd {worktree_path} && "
         f"claude --session-id {session_id} {skip_perms} "
-        f"\"$(cat .aidev_prompt.txt)\""
+        f"\"$(cat .claude-code/.aidev_prompt.txt)\""
     )
     procs.tmux_send(tmux_name, claude_cmd)
 

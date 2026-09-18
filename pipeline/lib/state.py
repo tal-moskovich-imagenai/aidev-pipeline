@@ -52,13 +52,18 @@ def all_in_state(state):
         return [dict(r) for r in rows]
 
 
-ACTIVE_STATES = ("NEW", "RUNNING", "STUCK", "POSTPROCESS", "PR_OPENED", "DONE")
+ACTIVE_STATES = ("NEW", "RUNNING", "STUCK", "POSTPROCESS", "PR_OPENED")
 CLEANUP_CANDIDATE_STATES = ("RUNNING", "STUCK", "POSTPROCESS", "PR_OPENED", "DONE", "FAILED")
 
 
 def count_active():
     """Tickets currently occupying a Claude Code slot (not yet archived or
-    permanently failed). Used to cap concurrent pickups."""
+    permanently failed). Used to cap concurrent pickups. DONE is deliberately
+    excluded: a DONE ticket has already handed off to human review (In
+    Review + aidev-done in Jira) — no Claude session or worktree work is
+    happening for it, so it shouldn't block a new ticket from being picked
+    up. It only occupies a rework slot again if a human reopens it, at
+    which point reopen_for_rework moves it back to RUNNING and it counts."""
     with db() as conn:
         placeholders = ",".join("?" * len(ACTIVE_STATES))
         row = conn.execute(
@@ -157,15 +162,52 @@ def _migrate(conn):
         conn.execute("ALTER TABLE tickets ADD COLUMN stacked_on TEXT")
     if "stacked_on_branch" not in cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN stacked_on_branch TEXT")
+    if "postprocess_attempts" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN postprocess_attempts INTEGER NOT NULL DEFAULT 0")
+    if "last_postprocess_error" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN last_postprocess_error TEXT")
+    if "stage" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN stage TEXT NOT NULL DEFAULT 'implement'")
+
+
+def set_stage(ticket_key, stage):
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET stage = ?, updated_at = datetime('now') WHERE ticket_key = ?",
+            (stage, ticket_key),
+        )
+
+
+def record_postprocess_failure(ticket_key, error):
+    """Transient PR-step failure: bump the retry counter and go back to
+    POSTPROCESS (not FAILED) so the next monitor.py run retries — the work is
+    already committed, no tmux/Claude session needed for a retry."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET state = 'POSTPROCESS', postprocess_attempts = postprocess_attempts + 1, "
+            "last_postprocess_error = ?, updated_at = datetime('now') WHERE ticket_key = ?",
+            (str(error), ticket_key),
+        )
+
+
+def clear_postprocess_failure(ticket_key):
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET postprocess_attempts = 0, last_postprocess_error = NULL WHERE ticket_key = ?",
+            (ticket_key,),
+        )
 
 
 def seconds_running(ticket):
     """Returns elapsed seconds since running_since, or None if unset/unparseable."""
-    running_since = ticket.get("running_since")
-    if not running_since:
+    return _seconds_since(ticket.get("running_since"))
+
+
+def _seconds_since(timestamp_str):
+    if not timestamp_str:
         return None
     try:
-        started = datetime.strptime(running_since, "%Y-%m-%d %H:%M:%S")
+        started = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
     return (datetime.utcnow() - started).total_seconds()

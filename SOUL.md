@@ -88,3 +88,52 @@ report that plainly and stop — don't paper over it with vague success
 language. A clear "I attempted X, it failed because Y, here's what I tried"
 is far more useful to whoever picks this up than a green checkmark hiding a
 half-solution.
+
+## Cursor Bugbot — wait for it, don't just open the PR and leave
+
+Once the orchestrator pushes your branch and opens the PR, Cursor Bugbot
+reviews it automatically. Don't consider the ticket done the moment the PR
+exists — Bugbot's findings are exactly the kind of thing a careless PR leaves
+unaddressed, and it's caught real issues here that `/custom-review` missed.
+
+Before you print `AIDEV_TASK_COMPLETE`, if a PR is already open for this
+branch (it usually isn't yet on the first pass — the orchestrator opens it
+after you finish — but IS open on a rework/bugbot-fix pass): check its
+Bugbot status with `gh pr view <branch> --json reviews` and read the most
+recent Cursor review comment on the current head commit.
+
+- If Bugbot hasn't reviewed the current commit yet, comment `@bugbot run` on
+  the PR (`gh pr comment <branch> --body '@bugbot run'`) and wait a
+  reasonable amount for it to finish (poll every ~30s, a few minutes cap) —
+  don't finish while it's still pending if you can reasonably wait it out.
+- If Bugbot flags real issues, fix them, commit, and push before finishing —
+  same bar as `/custom-review` findings: fix it or explain in the commit
+  message why you're leaving it. Don't finish with known Bugbot findings
+  unaddressed and unexplained.
+- If Bugbot is a false positive or genuinely out of scope, say so explicitly
+  in the commit message rather than silently ignoring it.
+- If you truly cannot get Bugbot to respond (integration down, times out
+  repeatedly) after reasonable effort, say so plainly in your final summary
+  instead of guessing it's fine — a human should know Bugbot never weighed in
+  rather than assume it did.
+
+This judgment call — read the review, decide if it's worth fixing, decide
+when you've waited long enough — is yours to make, the same way you'd decide
+whether a human reviewer's comment needs a code change or just a reply. The
+orchestrator does not parse or gate on Bugbot's text; it trusts you to have
+actually looked before saying you're done.
+
+Fixing the code is not the whole job — Bugbot's findings live as GitHub PR
+review threads, separate from the pass/fail summary comment, and fixing the
+underlying issue does NOT close them. Resolve each thread you addressed (or
+decided is a false positive/out of scope, with your reasoning left as a
+reply) before finishing:
+
+```bash
+gh api graphql -f query='query { repository(owner: "OWNER", name: "REPO") { pullRequest(number: N) {
+  reviewThreads(first: 50) { nodes { id isResolved } } } } }'
+gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "PRRT_..."}) { thread { isResolved } } }'
+```
+
+An open thread on a PR that looks otherwise clean reads as unfinished
+business to whoever reviews it next.

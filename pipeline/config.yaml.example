@@ -26,11 +26,25 @@ claude:
   max_wait_seconds: 5400                 # hard cap per postprocess stage (90 min)
   max_running_hours: 6                   # ticket marked FAILED if still RUNNING/STUCK past this
   max_concurrent: 3                      # cap on tickets occupying a Claude Code slot at once
-                                          # (RUNNING/STUCK/POSTPROCESS/PR_OPENED/DONE); extras wait
-                                          # for a slot to free up on the next pickup.py run
+                                          # (RUNNING/STUCK/POSTPROCESS/PR_OPENED); DONE tickets have
+                                          # already handed off to human review and don't count —
+                                          # extras wait for a slot to free up on the next pickup.py run
   stack_on_review: true                  # if a blocker is sitting at review_status (not merged),
                                           # branch the next ticket off the blocker's own branch
                                           # instead of waiting for it to merge (stacked PRs)
+  max_postprocess_attempts: 5            # transient PR-step failures (e.g. slow git commit/push
+                                          # in a big repo) retry this many times before FAILED;
+                                          # tmux/Claude session stays alive across retries
+
+codex:
+  enabled: true
+  timeout_seconds: 1800                  # 30 min hard cap on the codex exec subprocess
+  sandbox: "workspace-write"             # full permissions; the prompt tells it not to edit code
+  report_dir: ".claude-code"             # relative to the worktree; matches repo's scratch-doc convention
+  skill_globs:                           # read directly since Codex can't invoke Claude slash commands;
+                                          # globbed so a plugin version bump doesn't silently break this
+    - "/Users/talmoskovich/.claude/plugins/cache/imagen-skills/custom-simplify/*/SKILL.md"
+    - "/Users/talmoskovich/.claude/plugins/cache/imagen-skills/custom-review/*/SKILL.md"
 
 pr:
   open_pr: true
