@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     last_comment_id  TEXT,
     running_since    TEXT,
     stacked_on       TEXT,
+    stacked_on_branch TEXT,
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
@@ -85,12 +86,12 @@ def set_archived(ticket_key):
         )
 
 
-def insert(ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state="NEW", stacked_on=None):
+def insert(ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state="NEW", stacked_on=None, stacked_on_branch=None):
     with db() as conn:
         conn.execute(
-            "INSERT INTO tickets (ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state, running_since, stacked_on) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)",
-            (ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state, stacked_on),
+            "INSERT INTO tickets (ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state, running_since, stacked_on, stacked_on_branch) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)",
+            (ticket_key, repo_path, worktree_path, branch, session_id, tmux_session, state, stacked_on, stacked_on_branch),
         )
 
 
@@ -154,6 +155,8 @@ def _migrate(conn):
         conn.execute("ALTER TABLE tickets ADD COLUMN running_since TEXT")
     if "stacked_on" not in cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN stacked_on TEXT")
+    if "stacked_on_branch" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN stacked_on_branch TEXT")
 
 
 def seconds_running(ticket):

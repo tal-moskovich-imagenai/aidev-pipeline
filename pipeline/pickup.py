@@ -13,7 +13,7 @@ import sys
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib import config, jira_client, state, procs, lockfile
+from lib import config, jira_client, state, procs, lockfile, github
 from lib.pipelog import get_logger
 from lib.soul import soul_section
 
@@ -112,6 +112,9 @@ def pickup_ticket(issue):
         log(f"{key}: already tracked, skipping")
         return False
 
+    labels = issue["fields"].get("labels", [])
+    repo_path = config.repo_for(labels)
+
     review_status = cfg["jira"].get("review_status")
     blockers = jira_client.get_blocking_issues(key, review_status=review_status)
     hard_blockers = [(k, s) for k, s, hard in blockers if hard]
@@ -136,16 +139,25 @@ def pickup_ticket(issue):
             log(f"{key}: multiple soft blockers {soft_blockers} — stacking only supports one, skipping")
             return False
         stack_base_key, _ = soft_blockers[0]
-        blocker_ticket = state.get(stack_base_key)
-        if not blocker_ticket or not blocker_ticket.get("branch"):
-            log(f"{key}: blocker {stack_base_key} is In Review but not tracked locally (picked up by "
-                f"someone else, or a different repo) — cannot determine its branch, skipping")
-            return False
-        stack_base_branch = blocker_ticket["branch"]
-        log(f"{key}: stacking on {stack_base_key}'s branch {stack_base_branch} (still In Review, not merged)")
 
-    labels = issue["fields"].get("labels", [])
-    repo_path = config.repo_for(labels)
+        # Prefer the pipeline's own state DB (exact, no ambiguity). Fall
+        # back to searching GitHub for an open PR referencing the blocker's
+        # ticket key — covers blockers built manually, outside this pipeline.
+        blocker_ticket = state.get(stack_base_key)
+        if blocker_ticket and blocker_ticket.get("branch"):
+            stack_base_branch = blocker_ticket["branch"]
+            log(f"{key}: stacking on {stack_base_key}'s branch {stack_base_branch} "
+                f"(tracked locally, still In Review, not merged)")
+        else:
+            stack_base_branch = github.find_open_pr_branch(repo_path, stack_base_key)
+            if stack_base_branch:
+                log(f"{key}: stacking on {stack_base_key}'s branch {stack_base_branch} "
+                    f"(found via gh pr list, not tracked locally, still In Review)")
+            else:
+                log(f"{key}: blocker {stack_base_key} is In Review but has no local record and "
+                    f"no unambiguous open PR found via gh — cannot determine its branch, skipping")
+                return False
+
     worktree_root = cfg["worktree_root"]
     os.makedirs(worktree_root, exist_ok=True)
 
@@ -181,7 +193,8 @@ def pickup_ticket(issue):
     )
     procs.tmux_send(tmux_name, claude_cmd)
 
-    state.insert(key, repo_path, worktree_path, branch, session_id, tmux_name, state="RUNNING", stacked_on=stack_base_key)
+    state.insert(key, repo_path, worktree_path, branch, session_id, tmux_name, state="RUNNING",
+                 stacked_on=stack_base_key, stacked_on_branch=stack_base_branch)
 
     resume_cmd = f"cd {worktree_path} && claude --resume {session_id}"
     stack_note = f"\nStacked on: {stack_base_key} (still In Review — this branch will need rebasing once it merges)\n" if stack_base_key else ""
