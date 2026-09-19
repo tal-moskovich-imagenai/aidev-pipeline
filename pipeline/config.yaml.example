@@ -41,10 +41,11 @@ codex:
   timeout_seconds: 1800                  # 30 min hard cap on the codex exec subprocess
   sandbox: "workspace-write"             # full permissions; the prompt tells it not to edit code
   report_dir: ".claude-code"             # relative to the worktree; matches repo's scratch-doc convention
-  skill_globs:                           # read directly since Codex can't invoke Claude slash commands;
-                                          # globbed so a plugin version bump doesn't silently break this
-    - "/Users/talmoskovich/.claude/plugins/cache/imagen-skills/custom-simplify/*/SKILL.md"
-    - "/Users/talmoskovich/.claude/plugins/cache/imagen-skills/custom-review/*/SKILL.md"
+                                          # custom-simplify/custom-review are installed natively in Codex
+                                          # (~/.codex/config.toml plugins."*@imagen-skills", same
+                                          # imagen-skills marketplace repo as Claude's plugin cache) — the
+                                          # prompt invokes them with Codex's own $skill-name syntax, no
+                                          # path resolution needed here
 
 pr:
   open_pr: true
