@@ -482,7 +482,7 @@ def relaunch_claude(ticket, prompt):
     skip_perms = "--dangerously-skip-permissions" if cfg["claude"]["dangerously_skip_permissions"] else ""
     claude_cmd = (
         f"cd {worktree_path} && "
-        f"claude --session-id {session_id} {skip_perms} "
+        f"DISABLE_AUTOUPDATER=1 claude --session-id {session_id} {skip_perms} "
         f"\"$(cat .claude-code/.aidev_prompt.txt)\""
     )
     procs.tmux_send(tmux_name, claude_cmd)
