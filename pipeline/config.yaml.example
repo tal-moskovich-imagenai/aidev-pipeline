@@ -10,6 +10,7 @@ jira:
 
 repos:
   default: "/Users/talmoskovich/Documents/GitHub/submitter-app-electron"
+  app-web-server: "/Users/talmoskovich/Documents/GitHub/app-web-server"
   # add more "REPOKEY: /path/to/repo" here; a ticket can specify which repo via
   # a Jira label like "repo:REPOKEY", otherwise "default" is used.
 
