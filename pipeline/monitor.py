@@ -324,6 +324,12 @@ Now run your own review pass on the diff, in order:
 existed. Commit and push again if you make any changes (same worktree/branch
 — do not open a new PR).
 
+Before finishing, post your decisions log as its own PR comment: read
+`.claude-code/decisions-{key}.md` (if it doesn't exist, you made no notable
+judgment calls — skip this) and `gh pr comment {pr_url} --body '...'` with it
+formatted per the "Post a decisions log as its own PR comment" section above
+(aidev decisions / My decisions).
+
 When done, say exactly: AIDEV_TASK_COMPLETE
 """
 
@@ -517,9 +523,11 @@ Task:
 - Then push to the existing branch (this updates the existing PR automatically
   — do not open a new PR).
 
-If you are blocked and need clarification, print exactly:
-AIDEV_NEEDS_INPUT: <your question here, one line>
-and wait — a human will reply as a Jira comment and it will be relayed here.
+If you are blocked and need clarification, follow the same batching rule as
+the main implementation stage (see "`AIDEV_NEEDS_INPUT` fires at most once
+per ticket" above): research, keep working with a provisional answer, log to
+`.claude-code/decisions-{key}.md`, and only print one batched
+`AIDEV_NEEDS_INPUT` at the end if anything is still open.
 
 When you are fully done, committed, and pushed, say exactly: AIDEV_TASK_COMPLETE
 """

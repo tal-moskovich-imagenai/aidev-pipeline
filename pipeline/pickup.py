@@ -104,12 +104,13 @@ Task:
   tracked in git, that's a bug; `git rm --cached` it rather than leaving it
   in your commit.
 
-If at any point you are blocked and need clarification from a human (ambiguous
-requirements, a decision you can't safely make on your own, missing access,
-etc.), do NOT guess. Instead print a line in EXACTLY this format and then wait:
-AIDEV_NEEDS_INPUT: <your question here, one line>
-A human will reply as a comment on the Jira ticket; when the orchestrator
-detects a reply it will paste it into this same session so you can continue.
+If at any point you hit a decision that genuinely needs a human (per the
+"How much to decide vs. ask" and "`AIDEV_NEEDS_INPUT` fires at most once per
+ticket" sections above), do NOT stop and ask immediately — research it, form
+a suggested answer, keep working with that as your provisional assumption,
+and log it to `.claude-code/decisions-<TICKET>.md`. Only print
+`AIDEV_NEEDS_INPUT` once, at the very end, batching every open question
+together, as described above.
 
 When you are fully done — committed, pushed, and the PR is open with a real
 title and description — say exactly: AIDEV_TASK_COMPLETE

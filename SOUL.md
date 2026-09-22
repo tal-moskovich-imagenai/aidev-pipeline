@@ -66,6 +66,40 @@ When you do decide instead of asking, treat the decision as provisional and
 say so: state the assumption plainly in the commit/PR so a reviewer can
 correct it in one comment instead of archaeology.
 
+## `AIDEV_NEEDS_INPUT` fires at most once per ticket
+
+Every judgment call — confident or not — gets logged as you make it: append a
+line to `.claude-code/decisions-<TICKET>.md` (create it if missing) with what
+you decided and why. This file is the running record of the whole ticket, not
+just an escalation queue.
+
+When you hit something that actually clears the "ask" bar above: do the
+research anyway, form a real suggested answer, and **keep implementing using
+that suggestion as your working assumption** — do not stop mid-ticket to ask.
+Append it to an "Open questions" section in the same decisions file, with
+your research and suggested answer, not just the bare question.
+
+Only at the very end — right before you'd otherwise commit/push/open the PR —
+check that file. If "Open questions" is non-empty, print exactly ONE
+`AIDEV_NEEDS_INPUT` covering all of them together, e.g.:
+
+```
+AIDEV_NEEDS_INPUT:
+1. <question> — my read: <suggested answer>. Proceeding with this unless you say otherwise.
+2. <question> — my read: <suggested answer>. Proceeding with this unless you say otherwise.
+```
+
+Then wait. When the human replies, reconcile: fix anything they answered
+differently before finishing. Anything they didn't address keeps your
+provisional default — note that in the decisions file too.
+
+The only exception: you genuinely cannot produce *any* reasonable code
+without an answer (not "unsure which is better" — "no path forward exists").
+Even then, prefer stubbing/branching/scaffolding around it to keep the single
+end-of-ticket batch intact. If truly nothing else is left to do, fire
+`AIDEV_NEEDS_INPUT` immediately instead of stalling on an empty session — but
+this should be rare.
+
 ## What "done" means
 
 Done is not "the code runs." Done is:
@@ -88,6 +122,25 @@ report that plainly and stop — don't paper over it with vague success
 language. A clear "I attempted X, it failed because Y, here's what I tried"
 is far more useful to whoever picks this up than a green checkmark hiding a
 half-solution.
+
+## Post a decisions log as its own PR comment
+
+Once the PR exists (during `self_review`, the same stage that already runs
+`/custom-review` and tags the PR `ai-reviewed`), post the contents of
+`.claude-code/decisions-<TICKET>.md` as its own PR comment, structured in two
+sections:
+
+- **aidev decisions** — the confident judgment calls you made autonomously,
+  with your reasoning. This is what already lives in the commit/PR
+  description in prose form, made scannable as a list instead.
+- **My decisions** — the resolved "Open questions": the question, what the
+  human answered (or, if they didn't respond to a given item, your
+  provisional default that shipped), one line each.
+
+This is a separate comment from the PR description, not a replacement for it
+— a reviewer skimming for "what do I need to sanity-check" should be able to
+read this list in seconds instead of parsing narrative prose. Keep it terse:
+one line per decision, not a restatement of the whole diff.
 
 ## Cursor Bugbot — wait for it, don't just open the PR and leave
 
