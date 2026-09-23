@@ -56,15 +56,28 @@ rebase once the base merges.
 Description:
 {desc or '(no description provided)'}
 
-## Shared context — read before doing anything else
+## Shared context — read before doing anything else, and lives in the repo, not the worktree
 
 The ticket description or comments above may reference "must read" material:
-absolute file paths (e.g. under `.claude-code/` in some other worktree —
-brainstorm docs, decisions, handoff notes shared across multiple related
-tickets), Notion pages (use the `/notion` skill/slash-command to fetch them),
-Figma links (the Figma MCP is connected — use it to inspect designs/frames
-directly), Slack message links (the Slack MCP is connected — use it to fetch
-the actual message/thread content, not just a raw URL fetch), or other links.
+file paths (brainstorm docs, decisions, handoff notes shared across multiple
+related tickets), Notion pages (use the `/notion` skill/slash-command to
+fetch them), Figma links (the Figma MCP is connected — use it to inspect
+designs/frames directly), Slack message links (the Slack MCP is connected —
+use it to fetch the actual message/thread content, not just a raw URL
+fetch), or other links.
+
+**Where shared `.claude-code/` files actually live:** the canonical copy of
+any cross-ticket doc belongs in the **repo's own `.claude-code/`** directory
+(gitignored, next to the repo root — not inside a worktree). A worktree gets
+`git worktree remove --force`'d the moment its ticket reaches a terminal Jira
+status, which silently deletes anything that only ever lived there — while
+other tickets in the same epic may still be running and expecting to read
+it. You may draft or scratch inside your own worktree's `.claude-code/`
+while working, but before you finish, make sure the durable version is
+synced to the **repo root's** `.claude-code/` (copy it there if it isn't
+already), not left only in your soon-to-be-deleted worktree. If a referenced
+path is under some other worktree that no longer exists, treat that as data
+loss worth flagging, not something to silently re-derive.
 
 If any such references exist:
 1. Read every one of them FULLY before starting implementation. They often
@@ -75,11 +88,11 @@ If any such references exist:
    Treat it as a living document, not this ticket's private scratch space.
 3. When you learn something new, make a decision, or finish a step that
    future readers (you on a later ticket, a human, or another agent) would
-   need to know — APPEND it to the relevant file, in a clearly dated/labeled
-   section. Never overwrite or delete existing content, never rewrite
-   history, only add. Follow the file's existing structure/style if it has
-   one (e.g. a "Decisions" table, a dated "## Decisions taken while
-   implementing" section).
+   need to know — APPEND it to the relevant file **in the repo root's
+   `.claude-code/`**, in a clearly dated/labeled section. Never overwrite or
+   delete existing content, never rewrite history, only add. Follow the
+   file's existing structure/style if it has one (e.g. a "Decisions" table, a
+   dated "## Decisions taken while implementing" section).
 4. If no such references exist in this ticket, skip this section entirely —
    don't invent one.
 

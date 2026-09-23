@@ -509,11 +509,11 @@ is already committed and pushed. Do NOT start over or create a new branch.
 Reviewer feedback to address:
 {feedback}
 
-If the original ticket referenced shared context files (e.g. under
-`.claude-code/` in another worktree, Notion pages via `/notion`, Slack
-links), re-check them for anything the feedback might relate to, and keep
-appending any new decisions/learnings there — never overwrite existing
-content in those files, only add.
+If the original ticket referenced shared context files (repo root's
+`.claude-code/`, Notion pages via `/notion`, Slack links), re-check them for
+anything the feedback might relate to, and keep appending any new
+decisions/learnings there — repo root's `.claude-code/`, not this worktree's
+(it gets deleted on cleanup), never overwrite existing content, only add.
 
 Task:
 - Make the changes needed to address the feedback above, in this worktree.
