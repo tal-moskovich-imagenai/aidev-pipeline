@@ -119,6 +119,29 @@ def transition_issue(key, target_status_name):
     return _request("POST", f"/rest/api/3/issue/{key}/transitions", body={"transition": {"id": match["id"]}})
 
 
+def assign_issue(key, account_id):
+    """Assigns `key` to the Jira account with this accountId. Unused by the
+    pipeline itself (tickets must already be assigned before pickup — see
+    the aidev-jira-tickets skill), kept for manual/future use."""
+    return _request("PUT", f"/rest/api/3/issue/{key}/assignee", body={"accountId": account_id})
+
+
+def get_active_sprint_id(board_id):
+    """Returns the id of the single active sprint on `board_id`, or None if
+    there isn't exactly one (no active sprint, or board isn't sprint-based)."""
+    result = _request("GET", f"/rest/agile/1.0/board/{board_id}/sprint", params={"state": "active"})
+    sprints = result.get("values", [])
+    if len(sprints) != 1:
+        return None
+    return sprints[0]["id"]
+
+
+def add_issue_to_sprint(sprint_id, key):
+    """Moves `key` into `sprint_id` (Jira replaces any current sprint —
+    fine here since pipeline-picked tickets aren't in a sprint yet)."""
+    return _request("POST", f"/rest/agile/1.0/sprint/{sprint_id}/issue", body={"issues": [key]})
+
+
 STATE_LABELS = ("aidev-picked", "aidev-stuck", "aidev-done")
 
 

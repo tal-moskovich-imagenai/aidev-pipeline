@@ -242,6 +242,16 @@ def pickup_ticket(issue):
         jira_client.set_state_label(key, "aidev-picked")
     except Exception as e:
         log(f"{key}: label warning: {e}")
+    board_id = cfg["jira"].get("board_id")
+    if board_id:
+        try:
+            sprint_id = jira_client.get_active_sprint_id(board_id)
+            if sprint_id:
+                jira_client.add_issue_to_sprint(sprint_id, key)
+            else:
+                log(f"{key}: no single active sprint on board {board_id} — leaving out of sprint")
+        except Exception as e:
+            log(f"{key}: sprint-add warning: {e}")
 
     log(f"{key}: launched, session {session_id}")
     return True
@@ -270,7 +280,7 @@ def _run():
     else:
         free_slots = None
 
-    jql = f'labels = "{jcfg["label"]}" AND status = "{jcfg["todo_status"]}"'
+    jql = f'labels = "{jcfg["label"]}" AND status = "{jcfg["todo_status"]}" AND assignee = currentUser()'
     if jcfg.get("jql_extra"):
         jql += f" AND {jcfg['jql_extra']}"
 

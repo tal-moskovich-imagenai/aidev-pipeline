@@ -30,8 +30,24 @@ A ticket is "food" for the pipeline only if it has:
    - Acceptance criteria — how to know it's done
    - Any file/module hints if you already know where the change belongs
 3. **The `aidev` label.** Nothing runs without it.
-4. **Project = RND** (or whatever `jql_extra` in config.yaml currently scopes
+4. **Assignee = you.** `pickup.py` only polls `assignee = currentUser()` — an
+   `aidev`-labeled ticket with nobody assigned is invisible to pickup, and
+   also won't show up under your name on the board. Set the assignee
+   yourself when you tag a ticket `aidev` — it does not happen automatically.
+5. **Project = RND** (or whatever `jql_extra` in config.yaml currently scopes
    pickup to).
+
+## Sprint visibility
+
+If your board is sprint-scoped (shows only the active sprint), a
+pipeline-picked ticket is added to the board's current active sprint
+automatically the moment `pickup.py` picks it up (`jira.board_id` in
+config.yaml + the Agile Sprint API) — no separate step needed. If `board_id`
+isn't set, or there isn't exactly one active sprint on that board, this is
+skipped silently and the ticket stays wherever it already was (usually the
+backlog) — which can make an actively-running ticket look "missing" on a
+sprint-scoped board. Check status directly with `status.py` or the ticket
+itself rather than assuming the board reflects everything in flight.
 
 ## Shared context — "must read" material from your own brainstorming
 
