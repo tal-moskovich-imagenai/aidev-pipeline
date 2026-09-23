@@ -301,6 +301,15 @@ happens. `In Progress` is the only status that triggers `process_done_ticket`.
 
 ### Handing back a CI failure (or any other post-merge-review input)
 
+**Never fix a pipeline ticket's code yourself, even when the fix looks
+trivial.** Always hand it back to aidev via this loop instead. The agent
+working the ticket has context you don't have visible in a CI log or a
+quick diff read — the full ticket history, its own prior decisions, the
+rest of the branch. Patching it directly risks contradicting that context
+in a way that isn't obvious from outside it. This applies every time, not
+just when it's convenient — diagnose and describe the failure, don't patch
+it yourself.
+
 The same loop is the right tool any time you have new input for a `DONE`
 ticket, not just line-comment review feedback — a failing CI check, a
 Bugbot finding that needs a nudge, a spec change. Concretely, for a CI
