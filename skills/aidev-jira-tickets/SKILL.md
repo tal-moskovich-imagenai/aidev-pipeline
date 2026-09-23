@@ -294,6 +294,46 @@ makes that call. If a PR needs changes after review:
    first pass. Repeat as many times as needed.
 5. When you're actually satisfied, move it to `Done` yourself.
 
+**Do not move it to `New`/todo instead** — `pickup_ticket()` skips any ticket
+already tracked in the state DB (which a `DONE` ticket still is), so it just
+silently no-ops: no rework, no new worktree, no risk, but also nothing
+happens. `In Progress` is the only status that triggers `process_done_ticket`.
+
+### Handing back a CI failure (or any other post-merge-review input)
+
+The same loop is the right tool any time you have new input for a `DONE`
+ticket, not just line-comment review feedback — a failing CI check, a
+Bugbot finding that needs a nudge, a spec change. Concretely, for a CI
+failure:
+
+1. Comment on the ticket with the **actual failure**, not just "CI failed" —
+   paste the failing test name, the error, and the stack trace/line number.
+   Note which CI jobs passed vs failed (e.g. "only failed on
+   unit-non-ui-windows, passed on mac/ui") since that's often the fastest
+   clue to root cause (environment-specific vs a real logic bug). The more
+   diagnosis you hand over, the less the relaunched session has to
+   rediscover from scratch.
+2. Move status from `In Review` back to `In Progress` (see above — not New).
+3. Wait for the next `monitor.py` cycle (cron runs it every few minutes; see
+   `cronjob_manage`/`crontab` for the exact interval). No manual trigger
+   needed.
+
+Scripting this outside a live worktree (e.g. from an agent session that
+isn't `cd`'d into `~/jira-claude-pipeline`) needs `jira_client`'s
+`config.CONFIG_PATH` pointed at the deployed config explicitly —
+`lib/config.py` resolves it relative to the pipeline repo's own directory,
+which doesn't have `config.yaml` (that only exists at the deploy location,
+`~/jira-claude-pipeline/config.yaml`, gitignored). e.g.:
+
+```python
+from lib import config
+config.CONFIG_PATH = "/Users/talmoskovich/jira-claude-pipeline/config.yaml"
+from lib import jira_client  # now config.load() resolves correctly
+
+jira_client.add_comment("RND-XXXXX", "...")
+jira_client.transition_issue("RND-XXXXX", "In Progress")
+```
+
 ## What the pipeline does NOT do
 
 - It does not infer dependency order from ticket text, epic links, or
