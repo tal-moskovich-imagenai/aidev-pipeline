@@ -1,12 +1,17 @@
 """Minimal Jira Cloud REST v3 client, stdlib-only (urllib), auth via macOS Keychain."""
 import base64
 import json
+import re
 import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
 
 from . import config
+
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+_BARE_URL_RE = re.compile(r"(https?://[^\s<>\[\]()]+)")
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 
 
 def _get_token():
@@ -92,17 +97,85 @@ def get_blocking_issues(key, review_status=None):
     return blockers
 
 
+def _inline_nodes(text):
+    """Splits one line of text into ADF inline nodes, recognizing markdown
+    links `[text](url)`, bare URLs (both become real ADF link marks so Jira
+    renders a clickable link instead of literal text like "PR #5751"), and
+    `inline code` spans (rendered with the ADF code mark). Everything else
+    is plain text. Deliberately not a full markdown parser — just the bits
+    the pipeline's own comments actually use."""
+    nodes = []
+
+    def emit_plain_with_code(segment):
+        # Split `segment` on inline code spans, emitting code-marked nodes.
+        pos = 0
+        for m in _CODE_SPAN_RE.finditer(segment):
+            if m.start() > pos:
+                nodes.append({"type": "text", "text": segment[pos:m.start()]})
+            nodes.append({"type": "text", "text": m.group(1), "marks": [{"type": "code"}]})
+            pos = m.end()
+        if pos < len(segment):
+            nodes.append({"type": "text", "text": segment[pos:]})
+
+    # First split on markdown links, then bare URLs within the remainder.
+    pos = 0
+    for m in _MD_LINK_RE.finditer(text):
+        if m.start() > pos:
+            _split_bare_urls(text[pos:m.start()], nodes, emit_plain_with_code)
+        nodes.append({"type": "text", "text": m.group(1), "marks": [{"type": "link", "attrs": {"href": m.group(2)}}]})
+        pos = m.end()
+    if pos < len(text):
+        _split_bare_urls(text[pos:], nodes, emit_plain_with_code)
+
+    return nodes or [{"type": "text", "text": ""}]
+
+
+def _split_bare_urls(segment, nodes, emit_plain_with_code):
+    pos = 0
+    for m in _BARE_URL_RE.finditer(segment):
+        if m.start() > pos:
+            emit_plain_with_code(segment[pos:m.start()])
+        url = m.group(1)
+        nodes.append({"type": "text", "text": url, "marks": [{"type": "link", "attrs": {"href": url}}]})
+        pos = m.end()
+    if pos < len(segment):
+        emit_plain_with_code(segment[pos:])
+
+
+def _text_to_adf_content(text):
+    """Converts plain/lightly-markdown text into ADF document content:
+    ```lang fenced blocks become codeBlock nodes, everything else becomes
+    paragraphs with linkified URLs and `code` spans via _inline_nodes."""
+    content = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        if lines[i].strip().startswith("```"):
+            fence_lang = lines[i].strip()[3:].strip()
+            body_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                body_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing fence
+            code_attrs = {"language": fence_lang} if fence_lang else {}
+            content.append({
+                "type": "codeBlock",
+                "attrs": code_attrs,
+                "content": [{"type": "text", "text": "\n".join(body_lines)}] if body_lines else [],
+            })
+            continue
+        line = lines[i]
+        if line.strip() == "":
+            content.append({"type": "paragraph"})
+        else:
+            content.append({"type": "paragraph", "content": _inline_nodes(line)})
+        i += 1
+    return content
+
+
 def add_comment(key, text):
-    body = {
-        "body": {
-            "type": "doc",
-            "version": 1,
-            "content": [
-                {"type": "paragraph", "content": [{"type": "text", "text": line}]}
-                for line in text.split("\n")
-            ],
-        }
-    }
+    body = {"body": {"type": "doc", "version": 1, "content": _text_to_adf_content(text)}}
     return _request("POST", f"/rest/api/3/issue/{key}/comment", body=body)
 
 

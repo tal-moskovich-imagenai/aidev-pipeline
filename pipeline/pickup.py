@@ -50,6 +50,17 @@ is expected and correct, not a mistake. Do not try to remove or revert
 {stack_base_key}'s changes. When you open your PR, it will show as based on
 {stack_base_key}'s branch; that's normal for a stacked PR and a human will
 rebase once the base merges.
+
+Read {stack_base_key}'s actual diff and PR/ticket description in full before
+implementing — not just its title. `gh pr view <its-branch-or-number>` or
+`git log`/`git diff` against its branch. Knowing you're stacked on it isn't
+the same as knowing what it changed; you need that to build correctly on top
+of it.
+
+Also check whether anything is already stacked on THIS ticket — another open
+ticket/PR that lists {key} as its own blocker. If so, be aware your changes
+here can affect that work too (mention it in your PR description if it's
+relevant), since it's relying on whatever you land.
 """
     return f"""{soul_section()}You are working on Jira ticket {key}: {summary}
 {stack_note}
