@@ -37,8 +37,20 @@ def is_complete(pane):
 def find_needs_input(pane):
     """Returns the most recent real AIDEV_NEEDS_INPUT question in the pane,
     or None. Filters out the instructional placeholder line echoed from the
-    task prompt itself (contains the literal '<your question' template)."""
-    matches = [m.strip() for m in NEEDS_INPUT_RE.findall(pane) if "<your question" not in m]
+    task prompt itself — caught live on RND-14813: a newer prompt template
+    used '<quote the part of the verdict...>' as its placeholder, which the
+    old '<your question' substring check didn't catch, so the ticket was
+    falsely marked STUCK on the prompt's own template text before Claude
+    ever ran. Every AIDEV_NEEDS_INPUT template in this file uses angle
+    brackets around its placeholder (<describe ...>, <quote ...>, <one line:
+    ...>) and a real answer from Claude never legitimately starts with '<'
+    and ends with '>' — so filter generically on that shape instead of one
+    hardcoded phrase, which will also cover any future template without
+    another special case here."""
+    def is_placeholder(m):
+        m = m.strip()
+        return m.startswith("<") and m.endswith(">")
+    matches = [m.strip() for m in NEEDS_INPUT_RE.findall(pane) if not is_placeholder(m)]
     return matches[-1] if matches else None
 
 
@@ -735,7 +747,21 @@ not open a new PR), then say exactly: AIDEV_TASK_COMPLETE
 """
 
 
-def build_auto_merge_approval_prompt(key, summary, pr_url, verdict_text):
+def build_auto_merge_approval_prompt(key, summary, pr_url, verdict_text, repeat_count=1):
+    repeat_note = ""
+    if repeat_count >= 2:
+        repeat_note = f"""
+This exact verdict (same reason, not just similar wording) has now come
+back {repeat_count} times in a row across separate `/approve` attempts —
+whatever caused it did NOT change between attempts. If the reason is
+something re-approving genuinely cannot fix (e.g. a structural gate like
+"too many lines changed" — that number doesn't change just by asking
+again), do not comment `/approve` again; that's exactly the case the
+"unambiguous human review required" rule below is for, even if the verdict
+text itself doesn't use those words. Splitting the PR, or another concrete
+action, might be the real fix here — if you can't take that action
+yourself, this is a genuine AIDEV_NEEDS_INPUT case.
+"""
     return f"""{soul_section()}You are handling Cursor's Approval Agent verdict on Jira ticket {key}: {summary}'s
 PR ({pr_url}), as part of an auto-merge sequence. You are in the same
 worktree/branch as before — the existing implementation is already committed
@@ -745,7 +771,7 @@ Cursor's latest Approval Agent verdict on this PR (NOT an approval):
 ---
 {verdict_text}
 ---
-
+{repeat_note}
 Use your own judgment reading this verdict, the same way you'd read a human
 reviewer's comment — there is no fixed rule for what this text says, Cursor's
 wording varies run to run. In particular: a human reviewer being assigned to
@@ -761,10 +787,18 @@ someone was tagged in passing).
 - If the verdict tells you to run something (the custom-review skill, a
   fresh Bugbot pass, etc.) and you haven't already done that for the
   current commit, do it now — the same custom-review/custom-simplify skills
-  from earlier stages are available to you here.
-- If the verdict already reflects work you've done (e.g. you already ran
-  custom-review for this exact commit), or names nothing actionable, just
-  comment `/approve` again to get a fresh verdict.
+  from earlier stages are available to you here. Once you've taken that
+  real action (code changed and pushed, a label added/removed, a skill run
+  that genuinely wasn't run before on this commit), THEN comment `/approve`
+  to get a fresh verdict — the action is what justifies asking again, not
+  the other way round.
+- If the verdict names nothing actionable, or already reflects work you've
+  already done for this exact commit (you already ran custom-review, the
+  label's already set, etc.) — do NOT comment `/approve` again. Nothing
+  changed since the last ask, so asking again would just get the same
+  answer for no reason. Instead print exactly:
+AIDEV_NEEDS_INPUT: <one line: what the verdict says, why nothing here is actionable>
+  and stop.
 - Only if the verdict unambiguously states that a human review is required
   and already exists/is pending as the sole remaining path (not just "a
   reviewer is assigned" in passing) — do not comment `/approve` again, and
@@ -776,6 +810,52 @@ Otherwise, once you've taken whatever action applies (running a skill,
 committing/pushing if you changed anything, commenting `/approve`), say
 exactly: AIDEV_TASK_COMPLETE
 """
+
+
+_VERDICT_SIGNATURE_RE = re.compile(r"Risk: \w+\. (.+?)(?:<div>|$)", re.DOTALL)
+
+
+def _verdict_signature(body):
+    """Normalizes an Approval Agent verdict body down to its actual
+    judgment text (the 'Risk: ... Not approved — <reason>' sentence),
+    stripping the HTML/footer boilerplate that's identical on every review,
+    the run-specific automation IDs, and any digits, so two verdicts with
+    the same substantive reason compare as equal even if the exact number
+    drifts slightly between runs (caught live on PR #5759: '1134 lines...'
+    then '1133 lines...' one commit later — still the same '1000-line size
+    gate' reason, not a resolved one, but an exact-string compare missed
+    it and let the repeat count reset to 1)."""
+    body = body or ""
+    m = _VERDICT_SIGNATURE_RE.search(body)
+    text = m.group(1) if m else body
+    text = re.sub(r"[Rr]eviewers? (will be|are already|were already) assigned\.?", "", text)
+    text = re.sub(r"\d+", "#", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _repeated_approval_verdict_count(pr_details, marker="Approval Agent"):
+    """Counts how many of the most recent consecutive Approval Agent
+    verdicts (by submission order) share the same normalized signature —
+    i.e. how many times in a row Cursor has given the identical reason for
+    not approving. A verdict repeating unchanged across several /approve
+    attempts (caught live on PR #5759: the same 'over the 1000-line limit'
+    structural size gate, 5 times over ~50 minutes) means re-approving is
+    not going to change the outcome — that's a real stuck-waiting-on-human
+    case, not something another /approve or another Claude judgment pass
+    can resolve, since the size gate isn't fixable by discussion."""
+    verdicts = [r for r in pr_details.get("reviews", []) if marker in (r.get("body") or "")]
+    if not verdicts:
+        return 0
+    latest_sig = _verdict_signature(verdicts[-1].get("body"))
+    if not latest_sig:
+        return 0
+    count = 0
+    for r in reversed(verdicts):
+        if _verdict_signature(r.get("body")) == latest_sig:
+            count += 1
+        else:
+            break
+    return count
 
 
 def _latest_review_matching(pr_details, marker):
@@ -1133,9 +1213,28 @@ def process_auto_merge_ticket(ticket):
         # "reviewers will be assigned", which is routine boilerplate, not a
         # deferral). Hand the verdict text to Claude and let it judge — same
         # pattern as the Bugbot-findings relaunch above.
+        #
+        # But a hard backstop first: caught live on PR #5759, the SAME
+        # verdict (a structural "over the 1000-line size limit" gate) came
+        # back 5 times over ~50 minutes across repeated /approve comments —
+        # re-approving or re-judging text that hasn't changed was never
+        # going to produce a different outcome, since a size gate isn't
+        # something a re-read of the same words resolves. If the last few
+        # verdicts are identical, stop cycling Claude/`/approve` and
+        # actually escalate to a human instead.
+        repeat_count = _repeated_approval_verdict_count(details)
+        if repeat_count >= 2:
+            escalate_auto_merge(
+                ticket,
+                f"Cursor's Approval Agent has given the identical verdict {repeat_count} times in a "
+                f"row without change — re-approving isn't going to produce a different outcome. "
+                f"Latest verdict: {verdict_body[:400]}",
+                waiting_on_human=True,
+            )
+            return
         log(f"{key}: auto-merge — non-approval verdict, relaunching Claude to read and act on it")
-        def approval_prompt_builder(key, summary, pr_url, _text=verdict_body):
-            return build_auto_merge_approval_prompt(key, summary, pr_url, _text)
+        def approval_prompt_builder(key, summary, pr_url, _text=verdict_body, _repeat=repeat_count):
+            return build_auto_merge_approval_prompt(key, summary, pr_url, _text, repeat_count=_repeat)
         relaunch_for_stage(ticket, "auto_merge_addressing_approval_feedback", pr_url, approval_prompt_builder,
                             notice="auto-merge — Cursor did not approve, reading its verdict and acting on it")
         return
