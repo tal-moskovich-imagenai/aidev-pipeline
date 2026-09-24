@@ -973,19 +973,41 @@ def process_auto_merge_ticket(ticket):
         return
 
     if not bugbot_clean:
+        # The "Cursor Bugbot" entry in statusCheckRollup is a real CI check
+        # (not the review-comment text) with its own status/timestamps — use
+        # that instead of guessing a fixed re-trigger timeout. Bugbot's own
+        # response time varies a lot in practice (observed 5-28+ minutes
+        # between a manual "@bugbot run" and its reply across past PRs), so
+        # a flat 15-minute timer risks re-triggering while it's still
+        # legitimately running (yellow/IN_PROGRESS), which just restarts the
+        # wait and can loop. Only re-trigger if the check itself is not
+        # currently in progress.
+        bugbot_check = next(
+            (c for c in details.get("statusCheckRollup", []) if c.get("name") == "Cursor Bugbot"),
+            None,
+        )
+        bugbot_check_running = bool(bugbot_check) and (bugbot_check.get("status") or "").upper() in (
+            "IN_PROGRESS", "QUEUED", "PENDING", "REQUESTED", "WAITING",
+        )
         already_triggered = ticket.get("last_bugbot_trigger_sha") == head_sha
+        if already_triggered and bugbot_check_running:
+            log(f"{key}: auto-merge — Bugbot check still running for {head_sha[:8]}, waiting")
+            return  # give it more time; re-checked next cycle, no re-trigger
+        # Fallback for when there's no matching check at all (e.g. it hasn't
+        # started yet, or the workflow name changes) — a time-based backstop
+        # so this can't wait forever with nothing to poll.
         trigger_stale = True
-        if already_triggered and ticket.get("last_bugbot_trigger_at"):
+        if already_triggered and not bugbot_check and ticket.get("last_bugbot_trigger_at"):
             try:
                 triggered_at = datetime.strptime(ticket["last_bugbot_trigger_at"], "%Y-%m-%d %H:%M:%S")
-                trigger_stale = (datetime.utcnow() - triggered_at).total_seconds() > 900  # 15 min
+                trigger_stale = (datetime.utcnow() - triggered_at).total_seconds() > 1800  # 30 min
             except ValueError:
                 pass
-        if already_triggered and not trigger_stale:
-            log(f"{key}: auto-merge — already triggered Bugbot for {head_sha[:8]}, waiting for it to come back")
-            return  # give it more time; re-checked next cycle, no re-trigger
+        if already_triggered and not bugbot_check and not trigger_stale:
+            log(f"{key}: auto-merge — already triggered Bugbot for {head_sha[:8]}, no check visible yet, waiting")
+            return
         log(f"{key}: auto-merge — Bugbot hasn't reviewed the current commit yet, triggering it"
-            + (" (re-trigger: no response after 15min)" if already_triggered else ""))
+            + (" (re-trigger: not running per its check, or no response after 30min)" if already_triggered else ""))
         try:
             github.comment_on_pr(repo_path, pr_url, "@bugbot run")
             state.set_last_bugbot_trigger_sha(key, head_sha)
