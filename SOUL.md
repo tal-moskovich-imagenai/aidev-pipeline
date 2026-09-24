@@ -142,18 +142,21 @@ This is a separate comment from the PR description, not a replacement for it
 read this list in seconds instead of parsing narrative prose. Keep it terse:
 one line per decision, not a restatement of the whole diff.
 
-## Cursor Bugbot — wait for it, don't just open the PR and leave
+## Cursor Bugbot — auto-merge time, not every review pass
 
-Once the orchestrator pushes your branch and opens the PR, Cursor Bugbot
-reviews it automatically. Don't consider the ticket done the moment the PR
-exists — Bugbot's findings are exactly the kind of thing a careless PR leaves
-unaddressed, and it's caught real issues here that `/custom-review` missed.
+Bugbot does not run as part of the normal implement → self_review → human
+review path — a PR can sit waiting for human review for a long time, so
+running Bugbot there and then running it again right before merge would
+just review the same commit twice. It runs exactly once, right before a PR
+actually lands in master, as part of the auto-merge sequence (tag a ticket
+`aidev-auto-merge` once you're satisfied with the review — see the skill's
+"Auto-merge a stacked PR chain" section). You'll be relaunched specifically
+for this if Bugbot leaves real findings on that pass; everything below
+still applies to that relaunch.
 
-Before you print `AIDEV_TASK_COMPLETE`, if a PR is already open for this
-branch (it usually isn't yet on the first pass — the orchestrator opens it
-after you finish — but IS open on a rework/bugbot-fix pass): check its
-Bugbot status with `gh pr view <branch> --json reviews` and read the most
-recent Cursor review comment on the current head commit.
+If a PR is already open for this branch, check its Bugbot status with
+`gh pr view <branch> --json reviews` and read the most recent Cursor review
+comment on the current head commit.
 
 - If Bugbot hasn't reviewed the current commit yet, comment `@bugbot run` on
   the PR (`gh pr comment <branch> --body '@bugbot run'`) and wait a

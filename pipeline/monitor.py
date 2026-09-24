@@ -189,13 +189,16 @@ def finish_ticket(ticket):
       PR number — running it before the PR existed silently no-op'd this).
     - 'self_review': push whatever Claude changed, then run Codex as a
       non-critical second opinion (see lib/codex_runner) and relaunch Claude
-      only if Codex left real findings; otherwise skip straight to Bugbot.
+      only if Codex left real findings; otherwise hand off to human review
+      directly. Bugbot does NOT run here — it runs once, at auto-merge time
+      (right before the PR actually lands in master), not on every review
+      pass, since a PR can sit in human review for a long time and running
+      it here too would just mean running it twice for the same commit.
     - 'codex_check' (Claude just addressed Codex's findings, if any): push,
-      go to Bugbot.
-    - 'bugbot_check' (Claude just finished looking at Bugbot, possibly after
-      fixing something and pushing): push whatever's there, then hand off to
-      human review. No text parsing of Bugbot's output happens here — Claude
-      already made that judgment call before printing AIDEV_TASK_COMPLETE.
+      hand off to human review.
+    - 'auto_merge*' (Claude just resolved a conflict or fixed a Bugbot
+      finding as part of the auto-merge sequence): push, then re-enter the
+      auto-merge check from the top (see continue_auto_merge).
     """
     cfg = config.load()
     key = ticket["ticket_key"]
@@ -242,8 +245,8 @@ def finish_ticket(ticket):
         run_codex_stage(ticket, pr_url)
         return
 
-    if stage == "codex_check":
-        relaunch_for_stage(ticket, "bugbot_check", pr_url, build_bugbot_check_prompt)
+    if stage.startswith("auto_merge"):
+        continue_auto_merge(ticket, pr_url)
         return
 
     mark_review_done(ticket, pr_url, pr_out)
@@ -279,8 +282,10 @@ def relaunch_for_stage(ticket, next_stage, pr_url, prompt_builder, notice=None):
 def run_codex_stage(ticket, pr_url):
     """Non-critical: Codex's success/failure never blocks the pipeline. On
     any failure (disabled, not installed, timeout, no credits, bad output)
-    this logs and skips straight to the Bugbot stage, same as if Codex had
-    reported no findings."""
+    this logs and hands off to human review, same as if Codex had reported
+    no findings — Bugbot itself now only runs at auto-merge time (right
+    before the PR actually lands in master), not here, to avoid running it
+    twice for the same commit across a possibly-long review wait."""
     key = ticket["ticket_key"]
     try:
         issue = jira_client.get_issue(key, fields=["summary"])
@@ -290,8 +295,8 @@ def run_codex_stage(ticket, pr_url):
 
     ok, report_rel, detail = codex_runner.run_codex_review(ticket, key, summary, log=log)
     if not ok:
-        log(f"{key}: codex review skipped ({detail}) — proceeding to Bugbot")
-        relaunch_for_stage(ticket, "bugbot_check", pr_url, build_bugbot_check_prompt)
+        log(f"{key}: codex review skipped ({detail}) — handing off to human review")
+        mark_review_done(ticket, pr_url)
         return
 
     report_abs = os.path.join(ticket["worktree_path"], report_rel)
@@ -299,13 +304,13 @@ def run_codex_stage(ticket, pr_url):
         with open(report_abs) as f:
             report_text = f.read()
     except OSError as e:
-        log(f"{key}: codex report unreadable ({e}) — proceeding to Bugbot")
-        relaunch_for_stage(ticket, "bugbot_check", pr_url, build_bugbot_check_prompt)
+        log(f"{key}: codex report unreadable ({e}) — handing off to human review")
+        mark_review_done(ticket, pr_url)
         return
 
     if re.search(r"^##\s*Verdict:\s*CLEAN\b", report_text, re.MULTILINE):
-        log(f"{key}: codex review clean — proceeding to Bugbot")
-        relaunch_for_stage(ticket, "bugbot_check", pr_url, build_bugbot_check_prompt)
+        log(f"{key}: codex review clean — handing off to human review")
+        mark_review_done(ticket, pr_url)
         return
 
     log(f"{key}: codex review left findings at {report_rel} — relaunching Claude")
@@ -375,23 +380,6 @@ automatically — do not open a new PR). If you made no changes because
 there was nothing to fix, that's fine — just say so plainly.
 
 When done, say exactly: AIDEV_TASK_COMPLETE
-"""
-
-
-def build_bugbot_check_prompt(key, summary, pr_url):
-    return f"""{soul_section()}You just finished implementing Jira ticket {key}: {summary}, and the
-orchestrator has pushed your branch and opened the PR: {pr_url}
-
-Now follow the "Cursor Bugbot" section above: check the PR's Bugbot review on
-your current head commit, trigger it if it hasn't run yet, wait a reasonable
-amount for it, and fix anything real it flags (commit + push again if you do
-— you're in the same worktree/branch, don't open a new PR).
-
-Do not touch anything unrelated to what Bugbot flagged; this is not a second
-pass at the ticket's implementation.
-
-When you're satisfied Bugbot is either clean or you've made a good-faith
-effort and explained why anything outstanding is fine, say exactly: AIDEV_TASK_COMPLETE
 """
 
 
@@ -653,6 +641,336 @@ def process_done_ticket(ticket):
     notify(f"aidev: {key} rework started", feedback[:200])
 
 
+AUTO_MERGE_LABEL = "aidev-auto-merge"
+REQUIRED_LABEL = "ai-reviewed"
+
+
+def escalate_auto_merge(ticket, reason, waiting_on_human=False):
+    """Stops the auto-merge sequence and tells the human why. When
+    `waiting_on_human` is True this is a pause, not a dead end — Cursor
+    itself deferred to a human GitHub review (its own judgment call, not
+    something fixable by pushing code), so the ticket stays DONE with stage
+    `auto_merge_waiting_human` and every future DONE-sweep cycle re-checks
+    whether that approval landed, resuming automatically the moment it has.
+    Anything else genuinely can't proceed without a person looking at it, so
+    the label is removed — re-tag `aidev-auto-merge` once it's addressed to
+    try again, same as tagging a ticket in the first place."""
+    key = ticket["ticket_key"]
+    log(f"{key}: auto-merge {'waiting on human review' if waiting_on_human else 'stuck'} — {reason}")
+    try:
+        jira_client.add_comment(
+            key,
+            f"[aidev] auto-merge {'paused, waiting on a human GitHub review' if waiting_on_human else 'stuck'}: {reason}",
+        )
+    except Exception as e:
+        log(f"{key}: could not post auto-merge status comment: {e}")
+    if waiting_on_human:
+        state.set_stage(key, "auto_merge_waiting_human")
+    else:
+        try:
+            jira_client.remove_label(key, AUTO_MERGE_LABEL)
+        except Exception as e:
+            log(f"{key}: could not remove {AUTO_MERGE_LABEL} label: {e}")
+        state.set_stage(key, "implement")  # back to the normal DONE baseline
+    notify(f"aidev: {key} auto-merge {'waiting on human' if waiting_on_human else 'stuck'}", reason[:200])
+
+
+def build_auto_merge_conflict_prompt(key, summary, pr_url):
+    return f"""{soul_section()}You are resolving a merge conflict so Jira ticket {key}: {summary}'s PR
+({pr_url}) can merge to master as part of an auto-merge sequence. You are in
+the same worktree/branch as before — the existing implementation is already
+committed and pushed. Do NOT start over or create a new branch.
+
+`git merge origin/master` in this worktree and resolve any conflicts. Prefer
+keeping both sides where the conflicting hunks are genuinely independent
+additions (e.g. two unrelated fields added near each other) — that is the
+common case for a stacked PR whose sibling branches merged ahead of it.
+Verify the resolution actually builds/typechecks before committing (this
+repo's own convention — `npm run type:check` or equivalent). If the conflict
+is semantically ambiguous (the two sides changed the same behavior in
+different, incompatible ways) do NOT guess — print exactly:
+AIDEV_NEEDS_INPUT: <describe the ambiguous conflict, one line>
+and stop.
+
+Otherwise, commit the resolution and push to the existing branch (this
+updates the existing PR — do not open a new PR), then say exactly:
+AIDEV_TASK_COMPLETE
+"""
+
+
+def build_auto_merge_bugbot_fix_prompt(key, summary, pr_url, bugbot_review_text):
+    return f"""{soul_section()}You are addressing a Cursor Bugbot finding on Jira ticket {key}: {summary}'s
+PR ({pr_url}), as part of an auto-merge sequence. You are in the same
+worktree/branch as before — the existing implementation is already committed
+and pushed. Do NOT start over or create a new branch.
+
+Bugbot's latest review on this PR:
+---
+{bugbot_review_text}
+---
+
+Fix what's real, same judgment as any other Bugbot pass — explain in the
+commit message why you're leaving anything you disagree with or consider a
+false positive, rather than silently ignoring it. Resolve the GitHub review
+threads for whatever you addressed (see the "Cursor Bugbot" section above
+for the `gh api graphql` commands).
+
+Commit and push to the existing branch (this updates the existing PR — do
+not open a new PR), then say exactly: AIDEV_TASK_COMPLETE
+"""
+
+
+def _latest_review_matching(pr_details, marker):
+    """Returns the most recent review (by submission order, which is what
+    `gh pr view --json reviews` returns) whose body contains `marker`, or
+    None. Cursor posts both Bugbot and Approval Agent verdicts as reviews
+    from the same `cursor` author, so the body marker — not the author — is
+    what actually distinguishes them (`BUGBOT_REVIEW` vs `Cursor Approval
+    Agent`)."""
+    matches = [r for r in pr_details.get("reviews", []) if marker in (r.get("body") or "")]
+    return matches[-1] if matches else None
+
+
+def _last_approve_request_time(repo_path, pr_url):
+    """Returns the createdAt of the most recent `/approve` PR comment (ours
+    or anyone's — only aidev and humans post this convention), or None if
+    it's never been requested."""
+    comments = github.get_pr_comments(repo_path, pr_url)
+    approve_comments = [c for c in comments if (c.get("body") or "").strip() == "/approve"]
+    return approve_comments[-1]["createdAt"] if approve_comments else None
+
+
+def _required_checks_green(pr_details):
+    """True only if every non-skipped check succeeded. A check still
+    queued/pending is treated as not-yet-green (retry next cycle), not as a
+    failure — only an explicit failing conclusion blocks."""
+    for c in pr_details.get("statusCheckRollup", []):
+        conclusion = (c.get("conclusion") or c.get("state") or "").upper()
+        if conclusion in ("SKIPPED", "NEUTRAL"):
+            continue
+        if conclusion not in ("SUCCESS",):
+            return False
+    return True
+
+
+def _has_changelog_entry(repo_path, branch, base):
+    """True if the branch adds a file under changelogs/*/unreleased/, or
+    edits a legacy changelogs/*/CHANGELOG.md directly (see
+    .agents/rules/changelog.md — both satisfy the enforcer)."""
+    diff = procs.sh(
+        f"git diff --name-only {procs.shlex.quote(base)}...{procs.shlex.quote(branch)}",
+        cwd=repo_path, check=False,
+    )
+    for line in diff.splitlines():
+        if re.match(r"^changelogs/[^/]+/unreleased/.+\.md$", line):
+            return True
+        if re.match(r"^changelogs/[^/]+/CHANGELOG\.md$", line):
+            return True
+    return False
+
+
+def _looks_like_source_change(repo_path, branch, base):
+    diff = procs.sh(
+        f"git diff --name-only {procs.shlex.quote(base)}...{procs.shlex.quote(branch)}",
+        cwd=repo_path, check=False,
+    )
+    return any(re.search(r"\.(ts|tsx|js|jsx|css|scss|vue|py)$", line) for line in diff.splitlines())
+
+
+def process_auto_merge_ticket(ticket):
+    """DONE tickets tagged `aidev-auto-merge` — see the skill's "Auto-merge
+    a stacked PR chain" section for the full design and why. Runs entirely
+    off `gh`/git; only spins up a Claude session (via relaunch_claude, same
+    as the rework loop) for the two sub-steps that genuinely need judgment:
+    resolving a real merge conflict, and fixing a real Bugbot finding.
+    Everything else here is mechanical and safe to retry every cycle."""
+    key = ticket["ticket_key"]
+    pr_url = ticket.get("pr_url")
+    repo_path = ticket["repo_path"]
+    branch = ticket["branch"]
+
+    try:
+        cfg = config.load()
+        issue = jira_client.get_issue(key, fields=["status", "labels"])
+        status_name = issue["fields"]["status"]["name"]
+        labels = issue["fields"]["labels"]
+    except Exception as e:
+        log(f"{key}: could not check status/labels for auto-merge: {e}")
+        return
+    if AUTO_MERGE_LABEL not in labels:
+        return
+    # Never act on a ticket that isn't genuinely done and handed off —
+    # `state.all_in_state("DONE")` reflects the local state DB, which could
+    # in principle drift from Jira (a rework got triggered concurrently, a
+    # human moved it manually); re-verify against Jira itself before ever
+    # touching the PR. Running work must never be auto-merged.
+    if status_name.lower() != cfg["jira"]["review_status"].lower() or "aidev-done" not in labels:
+        log(f"{key}: auto-merge label present but ticket is not In Review + aidev-done "
+            f"(status={status_name}, labels={labels}) — skipping, not touching running work")
+        return
+
+    if not pr_url:
+        escalate_auto_merge(ticket, "no PR URL recorded for this ticket")
+        return
+
+    details = github.get_pr_details(repo_path, pr_url)
+    if not details:
+        log(f"{key}: could not fetch PR details this cycle, will retry")
+        return
+
+    if details["baseRefName"] != "master":
+        log(f"{key}: auto-merge — base is {details['baseRefName']}, not master yet, skipping")
+        return
+
+    log(f"{key}: auto-merge — base is master, proceeding")
+
+    # --- conflict check -------------------------------------------------
+    if details["mergeable"] == "CONFLICTING" or details["mergeStateStatus"] == "DIRTY":
+        log(f"{key}: auto-merge — merge conflict, relaunching Claude to resolve")
+        relaunch_for_stage(ticket, "auto_merge_resolving_conflict", pr_url, build_auto_merge_conflict_prompt,
+                            notice="auto-merge hit a conflict with master — resolving it")
+        return
+
+    # --- bugbot loop ------------------------------------------------------
+    # Bugbot's own "clean" marker text, and its "real findings" text, both
+    # live in the comment body — see SOUL.md's Cursor Bugbot section for the
+    # exact conventions this mirrors.
+    latest_bugbot = _latest_review_matching(details, "BUGBOT_REVIEW")
+    bugbot_clean = bool(latest_bugbot) and "found no new issues" in (latest_bugbot.get("body") or "").lower()
+    bugbot_findings_text = (
+        latest_bugbot.get("body") if latest_bugbot and not bugbot_clean else None
+    )
+    if bugbot_findings_text:
+        log(f"{key}: auto-merge — Bugbot left findings, relaunching Claude to address them")
+        def prompt_builder(key, summary, pr_url, _text=bugbot_findings_text):
+            return build_auto_merge_bugbot_fix_prompt(key, summary, pr_url, _text)
+        relaunch_for_stage(ticket, "auto_merge_fixing_bugbot", pr_url, prompt_builder,
+                            notice="auto-merge — Bugbot left findings, fixing them")
+        return
+
+    if not bugbot_clean:
+        log(f"{key}: auto-merge — Bugbot hasn't reviewed the current commit yet, triggering it")
+        try:
+            github.comment_on_pr(repo_path, pr_url, "@bugbot run")
+        except Exception as e:
+            escalate_auto_merge(ticket, f"could not trigger Bugbot: {e}")
+        return  # give it time; re-checked next cycle
+
+    # --- gate checks --------------------------------------------------
+    label_names = {l["name"] for l in details.get("labels", [])}
+    if REQUIRED_LABEL not in label_names:
+        escalate_auto_merge(
+            ticket,
+            f"PR missing the '{REQUIRED_LABEL}' label — /custom-review may not have run. Not safe to auto-merge without it.",
+        )
+        return
+
+    if not _required_checks_green(details):
+        log(f"{key}: auto-merge — required checks not all green yet, waiting")
+        return
+
+    if "no-changelog" not in label_names:
+        try:
+            has_entry = _has_changelog_entry(repo_path, branch, "master")
+            source_change = _looks_like_source_change(repo_path, branch, "master")
+        except Exception as e:
+            escalate_auto_merge(ticket, f"could not determine changelog status: {e}")
+            return
+        if source_change and not has_entry:
+            escalate_auto_merge(
+                ticket,
+                "no changelog entry and this touches source files — not clear whether it's "
+                "customer-facing. Add an entry (`npm run changelog`) or tag the PR `no-changelog` "
+                "yourself if it genuinely isn't, then this will proceed.",
+            )
+            return
+
+    # --- approval ---------------------------------------------------------
+    approved = any(r.get("state") == "APPROVED" for r in details.get("reviews", []))
+
+    if approved:
+        log(f"{key}: auto-merge — approved, merging")
+        ok, out = github.merge_pr(repo_path, pr_url)
+        if not ok:
+            escalate_auto_merge(ticket, f"merge failed: {out}")
+            return
+        try:
+            jira_client.transition_issue(key, "Done")
+        except Exception as e:
+            log(f"{key}: could not transition to Done after merge: {e}")
+        try:
+            jira_client.add_comment(key, f"[aidev] Merged: {pr_url}")
+        except Exception as e:
+            log(f"{key}: could not post merge comment: {e}")
+        state.set_stage(key, "implement")
+        notify(f"aidev: {key} auto-merged", pr_url)
+        return
+
+    if details.get("reviewRequests"):
+        escalate_auto_merge(
+            ticket,
+            f"human reviewers requested on the PR ({', '.join(r.get('login', '?') for r in details['reviewRequests'])}) "
+            f"— waiting for their approval.",
+            waiting_on_human=True,
+        )
+        return
+
+    latest_approval_verdict = _latest_review_matching(details, "Approval Agent")
+    verdict_body = (latest_approval_verdict.get("body") or "") if latest_approval_verdict else ""
+
+    # Cursor's Approval Agent explicitly declining and pointing at human
+    # review (as opposed to "not approving yet, here's what's missing") —
+    # this is its own judgment call (e.g. a PR too large/risky for it to
+    # sign off on), not something fixable by pushing more code. Its
+    # boilerplate always says "No reviewers assigned" when it hasn't
+    # actually deferred, so that phrase rules the deferral reading out.
+    if (
+        latest_approval_verdict
+        and "assign" in verdict_body.lower()
+        and "no reviewers assigned" not in verdict_body.lower()
+    ):
+        escalate_auto_merge(ticket, f"Cursor deferred to human reviewers: {verdict_body[:400]}", waiting_on_human=True)
+        return
+
+    last_request = _last_approve_request_time(repo_path, pr_url)
+    verdict_is_current = (
+        last_request
+        and latest_approval_verdict
+        and latest_approval_verdict.get("submittedAt", "") > last_request
+    )
+    bugbot_newer_than_verdict = (
+        verdict_is_current
+        and latest_bugbot
+        and latest_bugbot.get("submittedAt", "") > latest_approval_verdict.get("submittedAt", "")
+    )
+    if verdict_is_current and not bugbot_newer_than_verdict:
+        # Already asked since the last relevant change, and got an answer
+        # that was neither APPROVED nor a human-deferral above — it named
+        # something fixable (Bugbot not run/timed out, custom-review
+        # needed) that this same cycle's Bugbot check above should already
+        # be addressing on the next pass. Don't spam another /approve until
+        # something's actually changed — a fresh, newer Bugbot review DOES
+        # count as a change worth re-asking about.
+        log(f"{key}: auto-merge — Cursor has not approved yet: {verdict_body[:200]}")
+        return
+
+    log(f"{key}: auto-merge — requesting Cursor approval")
+    try:
+        github.comment_on_pr(repo_path, pr_url, "/approve")
+    except Exception as e:
+        escalate_auto_merge(ticket, f"could not comment /approve: {e}")
+    return  # give it time; re-checked next cycle
+
+
+def continue_auto_merge(ticket, pr_url):
+    """Called from finish_ticket when a relaunched auto-merge Claude session
+    (conflict resolution or a Bugbot fix) finishes. Just re-enters the same
+    check from the top — the push it just did will be reflected in the next
+    `gh pr view`."""
+    state.set_stage(ticket["ticket_key"], "auto_merge_recheck")
+    process_auto_merge_ticket(ticket)
+
+
 def cleanup_worktree(ticket):
     """Removes the git worktree and local branch for a ticket. Safe to call
     even if the worktree is already gone. Never touches the remote branch —
@@ -739,6 +1057,14 @@ def _run():
             process_done_ticket(ticket)
         except Exception as e:
             log(f"ERROR processing done {ticket['ticket_key']}: {e}")
+
+    auto_merge_candidates = state.all_in_state("DONE")
+    log(f"Checking {len(auto_merge_candidates)} done ticket(s) for auto-merge")
+    for ticket in auto_merge_candidates:
+        try:
+            process_auto_merge_ticket(ticket)
+        except Exception as e:
+            log(f"ERROR auto-merging {ticket['ticket_key']}: {e}")
 
     candidates = state.all_cleanup_candidates()
     log(f"Checking {len(candidates)} ticket(s) for worktree cleanup (terminal Jira status)")

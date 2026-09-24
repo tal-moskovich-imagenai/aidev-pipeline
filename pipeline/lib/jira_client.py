@@ -274,6 +274,16 @@ def set_state_label(key, label):
     _request("PUT", f"/rest/api/3/issue/{key}", body={"fields": {"labels": sorted(current)}})
 
 
+def remove_label(key, label):
+    """Removes exactly one label, leaving every other label untouched. Uses
+    Jira's `update.labels[].remove` op — NOT a read-modify-write of the
+    whole label set — so a concurrent label change elsewhere can't get
+    clobbered by this call (see the RND-14792 incident: setting the whole
+    list wholesale once wiped a pipeline-managed label that had been added
+    between the read and the write)."""
+    _request("PUT", f"/rest/api/3/issue/{key}", body={"update": {"labels": [{"remove": label}]}})
+
+
 def get_comments(key):
     data = _request("GET", f"/rest/api/3/issue/{key}/comment")
     return data.get("comments", [])
