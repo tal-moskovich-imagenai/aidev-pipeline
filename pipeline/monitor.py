@@ -672,6 +672,11 @@ def escalate_auto_merge(ticket, reason, waiting_on_human=False):
         except Exception as e:
             log(f"{key}: could not remove {AUTO_MERGE_LABEL} label: {e}")
         state.set_stage(key, "implement")  # back to the normal DONE baseline
+    # Belt-and-suspenders: every caller of process_auto_merge_ticket expects
+    # to operate on a DONE ticket (that's what the sweep iterates), but a
+    # caller reached via continue_auto_merge may have come from POSTPROCESS
+    # — make sure escalating never silently drops the ticket out of DONE.
+    state.set_state(key, "DONE")
     notify(f"aidev: {key} auto-merge {'waiting on human' if waiting_on_human else 'stuck'}", reason[:200])
 
 
@@ -1037,10 +1042,20 @@ def process_auto_merge_ticket(ticket):
 
 def continue_auto_merge(ticket, pr_url):
     """Called from finish_ticket when a relaunched auto-merge Claude session
-    (conflict resolution or a Bugbot fix) finishes. Just re-enters the same
-    check from the top — the push it just did will be reflected in the next
-    `gh pr view`."""
-    state.set_stage(ticket["ticket_key"], "auto_merge_recheck")
+    (conflict resolution, a Bugbot fix, or a stale-review re-check) finishes.
+    Re-enters the same check from the top — the push it just did will be
+    reflected in the next `gh pr view`.
+
+    Must restore state to DONE first: finish_ticket already set it to
+    POSTPROCESS (its very first line) by the time we're called, and nothing
+    else on this path ever sets it back. Caught live: RND-14813 silently
+    dropped out of every future `state.all_in_state("DONE")` auto-merge
+    sweep after its conflict-resolution relaunch, since it was sitting in
+    PR_OPENED, not DONE, and the sweep only iterates DONE tickets."""
+    key = ticket["ticket_key"]
+    state.set_state(key, "DONE", pr_url=pr_url)
+    ticket = state.get(key)
+    state.set_stage(key, "auto_merge_recheck")
     process_auto_merge_ticket(ticket)
 
 
