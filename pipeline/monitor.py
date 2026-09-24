@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import codex_runner, config, jira_client, state, procs, lockfile, github
 from lib.pipelog import get_logger
 from lib.notify import notify
-from lib.soul import soul_section
+from lib.soul import soul_section, jira_live_fetch_note
 
 log = get_logger("monitor")
 
@@ -499,13 +499,15 @@ def build_rework_prompt(key, summary, feedback, pr_url):
         f"{i+1}. Run the slash command: {s}"
         for i, s in enumerate(config.load()["claude"]["post_steps"])
     )
+    live_fetch_note = jira_live_fetch_note(key, config.load()["jira"]["base_url"])
     return f"""{soul_section()}You are addressing human review feedback on Jira ticket {key}: {summary}
 
 This ticket already has an open PR: {pr_url}
 You are in the same worktree and branch as before — the existing implementation
 is already committed and pushed. Do NOT start over or create a new branch.
 
-Reviewer feedback to address:
+{live_fetch_note}
+Reviewer feedback (embedded snapshot — fallback only, see note above):
 {feedback}
 
 If the original ticket referenced shared context files (repo root's
@@ -521,6 +523,10 @@ Task:
 - Stage and commit ALL changes with a clear commit message that references {key}.
 - Then push to the existing branch (this updates the existing PR automatically
   — do not open a new PR).
+- Add a line to the PR (a new comment, or fold into the commit message)
+  stating which Jira source you worked from: "Jira context: live-fetched
+  via <tool>" or "Jira context: pipeline's embedded snapshot only (could
+  not live-fetch: <reason>)".
 
 If you are blocked and need clarification, follow the same batching rule as
 the main implementation stage (see "`AIDEV_NEEDS_INPUT` fires at most once

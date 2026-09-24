@@ -15,7 +15,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import config, jira_client, state, procs, lockfile, github
 from lib.pipelog import get_logger
-from lib.soul import soul_section
+from lib.soul import soul_section, jira_live_fetch_note
 
 log = get_logger("pickup")
 
@@ -39,12 +39,14 @@ def build_task_prompt(issue, stack_base_key=None):
     summary = issue["fields"]["summary"]
     desc = jira_client.plain_description(issue)
     comments = jira_client.format_comments_for_prompt(key)
+    live_fetch_note = jira_live_fetch_note(key, config.load()["jira"]["base_url"])
     comments_note = ""
     if comments:
         comments_note = f"""
-## Comments on this ticket — READ THESE, they can override the description
+## Comments on this ticket (embedded snapshot — see live-fetch note above)
 
-The description below may be stale: a human can refine, correct, or reverse
+Fallback only — re-fetch the live ticket per the note above first. The
+description below may be stale: a human can refine, correct, or reverse
 what it says in a comment posted after the ticket was written (e.g.
 "actually delete this, don't shrink it"). Comments are listed oldest first,
 each with its timestamp and author. If a comment conflicts with the
@@ -80,7 +82,8 @@ relevant), since it's relying on whatever you land.
 """
     return f"""{soul_section()}You are working on Jira ticket {key}: {summary}
 {stack_note}
-Description:
+{live_fetch_note}
+Description (embedded snapshot — fallback only, see note above):
 {desc or '(no description provided)'}
 {comments_note}
 ## Shared context — read before doing anything else, and lives in the repo, not the worktree
@@ -142,6 +145,12 @@ Task:
   GitHub → Jira with one click, and the PR title alone isn't reliable for
   this (not every PR titles itself with the key). Use:
   {config.load()["jira"]["base_url"]}/browse/{key}
+- State in the PR body which Jira source you actually worked from: either
+  "Jira context: live-fetched via <tool>" if you independently re-fetched
+  the ticket per the note above, or "Jira context: pipeline's embedded
+  snapshot only (could not live-fetch: <reason>)" if you couldn't. Don't
+  skip this line — a reviewer needs to know which one happened, not just
+  that Jira context existed somewhere.
 - Do NOT run /simplify, /custom-simplify, or /custom-review yet — those run
   in a follow-up pass after the PR exists (custom-review needs a real PR to
   tag and comment on).
