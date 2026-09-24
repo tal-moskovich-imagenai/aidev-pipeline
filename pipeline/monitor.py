@@ -16,9 +16,10 @@ import re
 import subprocess
 import sys
 import uuid
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib import codex_runner, config, jira_client, state, procs, lockfile
+from lib import codex_runner, config, jira_client, state, procs, lockfile, github
 from lib.pipelog import get_logger
 from lib.notify import notify
 from lib.soul import soul_section
@@ -542,6 +543,68 @@ When you are fully done, committed, and pushed, say exactly: AIDEV_TASK_COMPLETE
 """
 
 
+def gather_rework_feedback(ticket):
+    """Collects new review feedback from both Jira and the PR's GitHub
+    comments since this ticket last went DONE, and returns it as one
+    combined text block (or None if there's nothing new on either side).
+
+    Jira comment authored by us always starts "[aidev]"/"\u2705" (existing
+    convention); on GitHub the equivalent is the decisions-log comment,
+    which always starts "**aidev decisions" (see SOUL.md's "Post a decisions
+    log" section) \u2014 both are filtered out as our own output, not feedback.
+    A handful of routine bot/automation authors are filtered too so a
+    `@bugbot run` trigger comment or a CI bot post doesn't masquerade as
+    human feedback."""
+    key = ticket["ticket_key"]
+    since = ticket.get("updated_at")  # last time this ticket's state changed (i.e. went DONE)
+
+    jira_feedback = None
+    try:
+        issue = jira_client.get_issue(key, fields=["comment"])
+        for c in reversed(issue["fields"]["comment"]["comments"]):
+            text = jira_client.plain_description({"fields": {"description": c["body"]}})
+            if not text.strip().startswith("[aidev]") and not text.strip().startswith("\u2705"):
+                jira_feedback = text
+                break
+    except Exception as e:
+        log(f"{key}: could not fetch Jira comments for rework check: {e}")
+
+    github_feedback = None
+    try:
+        pr_comments = github.get_pr_comments(ticket["repo_path"], ticket.get("pr_url"))
+        bot_authors = {"github-actions", "cursor", "cursor-ai", "dependabot", "sonarqubecloud"}
+        since_dt = None
+        if since:
+            try:
+                since_dt = datetime.strptime(since, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+        for c in reversed(pr_comments):
+            author = (c.get("author") or {}).get("login", "")
+            body = (c.get("body") or "").strip()
+            created_at = c.get("createdAt", "")
+            if since_dt and created_at:
+                try:
+                    created_dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+                    if created_dt <= since_dt:
+                        break  # comments come oldest-first; nothing older is new
+                except ValueError:
+                    pass  # unparseable timestamp — don't skip on the strength of a bad date
+            if author.lower() in bot_authors:
+                continue
+            if body.startswith("**aidev decisions") or body.startswith("@bugbot"):
+                continue
+            if not body:
+                continue
+            github_feedback = f"(from {author} on the GitHub PR)\n{body}"
+            break
+    except Exception as e:
+        log(f"{key}: could not fetch PR comments for rework check: {e}")
+
+    parts = [p for p in (jira_feedback, github_feedback) if p]
+    return "\n\n---\n\n".join(parts) if parts else None
+
+
 def process_done_ticket(ticket):
     """DONE tickets whose Jira status was manually moved back to
     in_progress_status are review-feedback re-opens: relaunch Claude in the
@@ -551,7 +614,7 @@ def process_done_ticket(ticket):
     key = ticket["ticket_key"]
 
     try:
-        issue = jira_client.get_issue(key, fields=["status", "summary", "comment"])
+        issue = jira_client.get_issue(key, fields=["status", "summary"])
     except Exception as e:
         log(f"{key}: could not fetch issue for rework check: {e}")
         return
@@ -562,14 +625,7 @@ def process_done_ticket(ticket):
 
     log(f"{key}: moved back to {current_status} after DONE — treating as rework request")
 
-    comments = issue["fields"]["comment"]["comments"]
-    feedback = None
-    for c in reversed(comments):
-        text = jira_client.plain_description({"fields": {"description": c["body"]}})
-        if not text.strip().startswith("[aidev]") and not text.strip().startswith("✅"):
-            feedback = text
-            break
-
+    feedback = gather_rework_feedback(ticket)
     if not feedback:
         feedback = "(No specific comment found — re-review the PR and address anything outstanding.)"
 

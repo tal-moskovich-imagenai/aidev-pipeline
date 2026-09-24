@@ -282,24 +282,28 @@ status while a ticket is `RUNNING` in the pipeline's state DB can desync it.
 You control the `In Review → Done` transition entirely — the pipeline never
 makes that call. If a PR needs changes after review:
 
-1. Move the ticket's status back to `In Progress` and leave a comment with
-   the feedback **on the Jira ticket** — not the PR. `process_done_ticket`
-   only reads `jira_client.get_issue(key, fields=["status", "comment"])`;
-   it has no GitHub API call in this path at all. A comment posted only on
-   the PR is invisible to it — it takes the most recent Jira comment that
-   doesn't start with `[aidev]`/`✅` as the feedback text, full stop. Feel
-   free to also comment on the PR for a human reading it there later, but
-   that's for people, not the pipeline — the Jira comment is the one that
-   actually does something.
-2. The next `monitor.py` run detects a `DONE` ticket now sitting on
+1. Move the ticket's status back to `In Progress` — that's the actual
+   trigger `monitor.py` watches for.
+2. Leave a comment with the feedback, **on either the Jira ticket or the PR
+   on GitHub** — `gather_rework_feedback()` reads both sources and combines
+   whatever's new since the ticket last went DONE. This matters because
+   review naturally happens on GitHub, and not every reviewer wants to
+   context-switch to Jira just to leave a note. A PR comment from a bot/CI
+   author, or one that's our own output (`@bugbot run`, the `**aidev
+   decisions` log), is filtered out — only real human feedback counts.
+   Our own automated comments (rework acknowledgment, decisions log,
+   pickup notices) still only ever post to Jira, never to the PR — see
+   "Handing back a CI failure" above.
+3. The next `monitor.py` run detects a `DONE` ticket now sitting on
    `In Progress` again, treats it as a rework request, and relaunches Claude
-   Code **in the same worktree and branch** with your comment as context.
-3. Claude addresses the feedback, re-runs the review steps, commits, and
+   Code **in the same worktree and branch** with the combined feedback as
+   context.
+4. Claude addresses the feedback, re-runs the review steps, commits, and
    pushes to the **same branch** — this updates the existing PR, no
    duplicate is created.
-4. The ticket lands back on `In Review` + `aidev-done` once done, same as the
+5. The ticket lands back on `In Review` + `aidev-done` once done, same as the
    first pass. Repeat as many times as needed.
-5. When you're actually satisfied, move it to `Done` yourself.
+6. When you're actually satisfied, move it to `Done` yourself.
 
 **Do not move it to `New`/todo instead** — `pickup_ticket()` skips any ticket
 already tracked in the state DB (which a `DONE` ticket still is), so it just
