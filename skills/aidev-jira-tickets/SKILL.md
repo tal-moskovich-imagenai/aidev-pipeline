@@ -283,7 +283,14 @@ You control the `In Review → Done` transition entirely — the pipeline never
 makes that call. If a PR needs changes after review:
 
 1. Move the ticket's status back to `In Progress` and leave a comment with
-   the feedback.
+   the feedback **on the Jira ticket** — not the PR. `process_done_ticket`
+   only reads `jira_client.get_issue(key, fields=["status", "comment"])`;
+   it has no GitHub API call in this path at all. A comment posted only on
+   the PR is invisible to it — it takes the most recent Jira comment that
+   doesn't start with `[aidev]`/`✅` as the feedback text, full stop. Feel
+   free to also comment on the PR for a human reading it there later, but
+   that's for people, not the pipeline — the Jira comment is the one that
+   actually does something.
 2. The next `monitor.py` run detects a `DONE` ticket now sitting on
    `In Progress` again, treats it as a rework request, and relaunches Claude
    Code **in the same worktree and branch** with your comment as context.
