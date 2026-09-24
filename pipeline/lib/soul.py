@@ -20,17 +20,22 @@ def soul_section():
 
 def jira_live_fetch_note(key, link):
     """Shared instruction, injected into every prompt that references a
-    Jira ticket: tells Claude to independently re-fetch the ticket's live
-    description/comments/attachments/linked-issues via its own Jira access
-    (mcp__jira, gh, or whatever tool is actually available in this session)
-    rather than trusting only the flattened text embedded below.
+    Jira ticket: tells Claude to independently re-fetch the ticket's full
+    live context — description, comments, attachments/images, blocking
+    links, the wider linked-issue chain, and epic/parent context — rather
+    than trusting only the flattened text embedded below. Explicitly names
+    `imagen-core:jira` as the preferred tool (globally installed,
+    AWS-Secrets-Manager-credentialed via the SessionStart hook already
+    configured on this machine — see internal-claude/setup.sh) since it
+    fetches richer detail than a raw API call (visually analyzes image
+    attachments, not just lists their URLs).
 
     Why both exist: the embedded text is a deterministic, code-level
     guarantee that at least a plain-text snapshot of the description and
     comments is present in the prompt no matter what — it does not depend
     on Claude remembering a step or a Jira tool actually working in this
     session. But it is a lossy flatten (no attachments, no images pasted
-    into comments, no linked-issue context, and it can go stale if a
+    into comments, no linked-issue/epic context, and it can go stale if a
     comment is edited after this prompt was built). Live-fetching adds
     that richer, current context on top — it does not replace the
     guarantee, because a prompt instruction can be skipped under pressure
@@ -54,12 +59,39 @@ def jira_live_fetch_note(key, link):
     return f"""## Before implementing — re-fetch the live ticket yourself
 
 The fallback context below is a plain-text snapshot the orchestrator took
-when building this prompt — a fallback, not the primary source. Use
-whatever Jira access you actually have in this session (the Jira MCP/skill,
-`gh`, or a direct API call) to independently fetch {key}'s live
-description, all comments, attachments, and any linked issues at {link}.
+when building this prompt — a fallback, not the primary source. Before
+starting real work, independently fetch the FULL live picture of {key}
+yourself:
+
+- **Preferred tool**: the `imagen-core:jira` skill (invoke via
+  `Skill(skill="imagen-core:jira")` — it's globally installed and
+  already credentialed in this environment via AWS Secrets Manager). It
+  fetches richer detail than a raw API call, including downloading and
+  visually analyzing image attachments, not just listing their URLs. Fall
+  back to `gh`/a direct Jira API call only if that skill genuinely isn't
+  available in this session.
+- Get ALL of the following, not just the description:
+  - **Description** — the current live text, which may have been edited
+    since this prompt was built.
+  - **Every comment**, oldest to newest — a later comment overrides the
+    description on conflict (a human correcting/narrowing scope after the
+    fact is common and easy to miss if you only read the description).
+  - **Images and attachments** — screenshots, recordings, anything
+    attached to the ticket or pasted into a comment. These are often the
+    actual bug report; the prose around them can be incomplete without
+    them. Look at each one directly, don't just note that it exists.
+  - **Blocking/blocked-by links** — is this ticket genuinely unblocked
+    right now, and does it block anything that assumes it isn't done yet?
+  - **The linked-issue chain** — any ticket this one references or is
+    stacked on, not just direct blockers (a design decision recorded on a
+    sibling ticket can matter here even without a formal Jira link type).
+  - **Epic/parent context** — if this ticket has a parent epic, read it
+    too; the epic often carries the actual goal and constraints an
+    individual ticket assumes without repeating.
 
 This snapshot can already be stale (a comment posted after this prompt was
-built, an image attached to a comment, a linked ticket) — the live fetch is
-the source of truth if it disagrees with what's embedded below.
+built, an image attached to a comment, a linked ticket, an edited
+description) — the live fetch is the source of truth if it disagrees with
+what's embedded below. Read {link} for the ticket itself; follow whatever
+links/attachments/epic reference you find from there.
 """
