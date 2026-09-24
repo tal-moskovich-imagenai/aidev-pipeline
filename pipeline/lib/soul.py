@@ -18,7 +18,7 @@ def soul_section():
     return f"\n---\n{soul}\n---\n\n" if soul else ""
 
 
-def jira_live_fetch_note(key, base_url):
+def jira_live_fetch_note(key, link):
     """Shared instruction, injected into every prompt that references a
     Jira ticket: tells Claude to independently re-fetch the ticket's live
     description/comments/attachments/linked-issues via its own Jira access
@@ -45,15 +45,19 @@ def jira_live_fetch_note(key, base_url):
     description or your final summary (e.g. "worked from the pipeline's
     embedded Jira snapshot; could not independently re-fetch the live
     ticket in this session") so a human reviewing later knows which source
-    you actually used, not just that Jira context existed somewhere."""
+    you actually used, not just that Jira context existed somewhere.
+
+    `link` is the same ticket URL already printed elsewhere in the prompt
+    (build_jira_context_block returns it) — passed in rather than
+    re-derived here, so there is exactly one place per prompt that
+    constructs {base_url}/browse/{key}, not two copies that could drift."""
     return f"""## Before implementing — re-fetch the live ticket yourself
 
-The description and comments embedded below are a plain-text snapshot the
-orchestrator took when building this prompt — a fallback, not the primary
-source. Use whatever Jira access you actually have in this session (the
-Jira MCP/skill, `gh`, or a direct API call) to independently fetch {key}'s
-live description, all comments, attachments, and any linked issues:
-{base_url}/browse/{key}
+The fallback context below is a plain-text snapshot the orchestrator took
+when building this prompt — a fallback, not the primary source. Use
+whatever Jira access you actually have in this session (the Jira MCP/skill,
+`gh`, or a direct API call) to independently fetch {key}'s live
+description, all comments, attachments, and any linked issues at {link}.
 
 This snapshot can already be stale (a comment posted after this prompt was
 built, an image attached to a comment, a linked ticket) — the live fetch is

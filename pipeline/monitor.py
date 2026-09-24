@@ -499,8 +499,10 @@ def build_rework_prompt(key, summary, feedback, pr_url):
         f"{i+1}. Run the slash command: {s}"
         for i, s in enumerate(config.load()["claude"]["post_steps"])
     )
-    live_fetch_note = jira_live_fetch_note(key, config.load()["jira"]["base_url"])
+    link = f"{config.load()['jira']['base_url']}/browse/{key}"
+    live_fetch_note = jira_live_fetch_note(key, link)
     return f"""{soul_section()}You are addressing human review feedback on Jira ticket {key}: {summary}
+Link: {link}
 
 This ticket already has an open PR: {pr_url}
 You are in the same worktree and branch as before — the existing implementation

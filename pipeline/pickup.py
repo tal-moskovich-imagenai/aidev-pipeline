@@ -37,25 +37,9 @@ def mark_failed(key, reason):
 def build_task_prompt(issue, stack_base_key=None):
     key = issue["key"]
     summary = issue["fields"]["summary"]
-    desc = jira_client.plain_description(issue)
-    comments = jira_client.format_comments_for_prompt(key)
-    live_fetch_note = jira_live_fetch_note(key, config.load()["jira"]["base_url"])
-    comments_note = ""
-    if comments:
-        comments_note = f"""
-## Comments on this ticket (embedded snapshot — see live-fetch note above)
-
-Fallback only — re-fetch the live ticket per the note above first. The
-description below may be stale: a human can refine, correct, or reverse
-what it says in a comment posted after the ticket was written (e.g.
-"actually delete this, don't shrink it"). Comments are listed oldest first,
-each with its timestamp and author. If a comment conflicts with the
-description, the comment wins — it is the more recent, more specific
-instruction. Read every comment before starting implementation, not just
-the description.
-
-{comments}
-"""
+    base_url = config.load()["jira"]["base_url"]
+    link, context_block = jira_client.build_jira_context_block(key, base_url)
+    live_fetch_note = jira_live_fetch_note(key, link)
     stack_note = ""
     if stack_base_key:
         stack_note = f"""
@@ -81,11 +65,12 @@ here can affect that work too (mention it in your PR description if it's
 relevant), since it's relying on whatever you land.
 """
     return f"""{soul_section()}You are working on Jira ticket {key}: {summary}
+Link: {link}
 {stack_note}
 {live_fetch_note}
-Description (embedded snapshot — fallback only, see note above):
-{desc or '(no description provided)'}
-{comments_note}
+Fallback context — description, comments, attachments, dependency links (see live-fetch note above; this is what to use only if the live fetch fails):
+{context_block}
+
 ## Shared context — read before doing anything else, and lives in the repo, not the worktree
 
 The ticket description or comments above may reference "must read" material:
@@ -143,8 +128,7 @@ Task:
   just the bare ticket key in prose or the title. A key by itself doesn't
   link anywhere on GitHub; incident/traceability review needs to jump
   GitHub → Jira with one click, and the PR title alone isn't reliable for
-  this (not every PR titles itself with the key). Use:
-  {config.load()["jira"]["base_url"]}/browse/{key}
+  this (not every PR titles itself with the key). Use: {link}
 - State in the PR body which Jira source you actually worked from: either
   "Jira context: live-fetched via <tool>" if you independently re-fetched
   the ticket per the note above, or "Jira context: pipeline's embedded

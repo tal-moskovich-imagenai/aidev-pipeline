@@ -310,7 +310,7 @@ def plain_description(issue):
     return "".join(walk(desc)).strip()
 
 
-def format_comments_for_prompt(key):
+def format_comments_for_prompt(key=None, comments=None):
     """Fetch and flatten all comments on a ticket into plain text, oldest
     first, each tagged with its author and timestamp. Comments are where a
     human most often refines or overrides what the description says after
@@ -319,8 +319,16 @@ def format_comments_for_prompt(key):
     full picture (build_task_prompt) must fetch this separately, not assume
     the description alone is authoritative. Skips the pipeline's own
     [aidev]/✅ status comments (see set_state_label callers) — those are
-    noise here, not human instructions."""
-    comments = get_comments(key)
+    noise here, not human instructions.
+
+    Pass `comments` (a comment list already fetched via get_issue, e.g. by
+    build_jira_context_block) to format it without a second API round trip.
+    Pass `key` alone only when no such list already exists — this makes its
+    own get_comments(key) call in that case."""
+    if comments is None:
+        if key is None:
+            raise ValueError("format_comments_for_prompt needs key or comments")
+        comments = get_comments(key)
     if not comments:
         return ""
     blocks = []
@@ -334,3 +342,63 @@ def format_comments_for_prompt(key):
         created = c.get("created", "")
         blocks.append(f"[{created} — {author}]\n{body.strip()}")
     return "\n\n".join(blocks)
+
+
+def build_jira_context_block(key, base_url):
+    """The ONE function every pipeline entry point that references a Jira
+    ticket must call — pickup (first pickup), rework (review reopen),
+    anywhere else a fresh session starts from a ticket reference. Single
+    source of truth for what "the ticket's context" means, so there is
+    exactly one place that decides which fields matter and how they're
+    formatted — not pickup.py fetching description one way and monitor.py
+    fetching comments another way, drifting out of sync over time.
+
+    Does ONE get_issue call for description/comments/attachments/issuelinks
+    (Jira lets multiple fields ride the same request — no reason to make
+    four round trips for one ticket), then appends the ticket's blockers
+    (who blocks it, and what it blocks) via a second call, since that's a
+    separate endpoint concern (issuelinks alone doesn't resolve each
+    blocker's live status without a second lookup already done by
+    get_blocking_issues).
+
+    Returns (link, context_text) — link is the bare ticket URL (always put
+    it in the prompt yourself, this function doesn't repeat it inline),
+    context_text is the full fallback context block: description, comments
+    (oldest first, bot noise filtered), attachment names/URLs (images
+    especially — the plain-text flatten cannot represent them, so list them
+    explicitly and tell Claude to fetch them), and the blocking-issue
+    relationship. This whole block is explicitly a FALLBACK — every caller
+    must still tell Claude to live-fetch the ticket itself first (see
+    jira_live_fetch_note in lib/soul.py) and use this only if that fails."""
+    issue = get_issue(key, fields=["summary", "description", "comment", "attachment", "issuelinks"])
+    link = f"{base_url}/browse/{key}"
+
+    desc = plain_description(issue)
+    comments = format_comments_for_prompt(comments=issue["fields"].get("comment", {}).get("comments", []))
+
+    attachments = issue["fields"].get("attachment", [])
+    attachments_block = ""
+    if attachments:
+        lines = [f"- {a.get('filename', 'unnamed')}: {a.get('content', '')}" for a in attachments]
+        attachments_block = (
+            "\nAttachments on this ticket (fetch and actually look at each one — "
+            "screenshots and recordings are often the real bug report, not the prose):\n"
+            + "\n".join(lines)
+        )
+
+    blockers = get_blocking_issues(key)
+    blockers_block = ""
+    if blockers:
+        lines = [f"- blocked by {k} (status: {s}, {'must wait' if hard else 'in review, may stack'})"
+                  for k, s, hard in blockers]
+        blockers_block = "\nDependency links (who this ticket is blocked by):\n" + "\n".join(lines)
+
+    parts = [f"Description:\n{desc or '(no description provided)'}"]
+    if comments:
+        parts.append(f"Comments (oldest first — a later comment overrides the description on conflict):\n{comments}")
+    if attachments_block:
+        parts.append(attachments_block.strip())
+    if blockers_block:
+        parts.append(blockers_block.strip())
+
+    return link, "\n\n".join(parts)
