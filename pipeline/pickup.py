@@ -120,6 +120,12 @@ Task:
   built and why — no placeholder like "automated by aidev". Follow this
   repo's own PR conventions if it has a template. A generic/empty PR
   description is not acceptable output for this ticket.
+- Include a real, clickable link to the Jira ticket in the PR body — not
+  just the bare ticket key in prose or the title. A key by itself doesn't
+  link anywhere on GitHub; incident/traceability review needs to jump
+  GitHub → Jira with one click, and the PR title alone isn't reliable for
+  this (not every PR titles itself with the key). Use:
+  {config.load()["jira"]["base_url"]}/browse/{key}
 - Do NOT run /simplify, /custom-simplify, or /custom-review yet — those run
   in a follow-up pass after the PR exists (custom-review needs a real PR to
   tag and comment on).
