@@ -128,6 +128,15 @@ def process_running_ticket(ticket):
         mark_failed(key, "tmux session disappeared while RUNNING (crash, reboot, or manual kill)")
         return
 
+    if not procs.claude_process_alive(tmux_name):
+        mark_failed(
+            key,
+            "tmux session is alive but the claude process inside it is not — it crashed or exited "
+            "(e.g. an unhandled API error) without finishing. The session's pane output up to that "
+            "point may still be useful context for a human or for a manual relaunch.",
+        )
+        return
+
     elapsed = state.seconds_running(ticket)
     if max_hours and elapsed and elapsed > max_hours * 3600:
         mark_failed(

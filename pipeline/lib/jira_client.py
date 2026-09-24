@@ -179,6 +179,51 @@ def add_comment(key, text):
     return _request("POST", f"/rest/api/3/issue/{key}/comment", body=body)
 
 
+def get_attachments(key):
+    """Returns the issue's current attachments (id, filename, content URL)."""
+    issue = get_issue(key, fields=["attachment"])
+    return issue["fields"].get("attachment", [])
+
+
+def attach_file(key, file_path):
+    """Uploads a local file (e.g. a screenshot) as an attachment on `key`.
+    Multipart, not the JSON-body _request path — Jira's attachments endpoint
+    also requires the X-Atlassian-Token: no-check header (CSRF check that
+    otherwise rejects the upload). Returns the created attachment dict.
+
+    The content download URL Jira returns 303-redirects to the actual file —
+    follow it (curl -L, or requests' default) when fetching it back."""
+    import mimetypes
+    import os
+    import uuid
+
+    boundary = uuid.uuid4().hex
+    filename = os.path.basename(file_path)
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {mime_type}\r\n\r\n"
+    ).encode() + file_bytes + f"\r\n--{boundary}--\r\n".encode()
+
+    cfg = config.load()["jira"]
+    url = cfg["base_url"].rstrip("/") + f"/rest/api/3/issue/{key}/attachments"
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Authorization", _auth_header())
+    req.add_header("X-Atlassian-Token", "no-check")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode(errors="replace")
+        raise RuntimeError(f"Jira attach_file {key} -> {e.code}: {err_body}") from e
+
+
 def get_transitions(key):
     return _request("GET", f"/rest/api/3/issue/{key}/transitions").get("transitions", [])
 

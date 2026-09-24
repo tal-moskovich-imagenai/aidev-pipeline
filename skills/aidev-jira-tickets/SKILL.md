@@ -360,3 +360,42 @@ python3 status.py          # table of all tracked tickets and their state
 tmux attach -t aidev-<TICKET-KEY>   # watch/intervene in a live session
 cd worktrees/<TICKET-KEY> && claude --resume <session-id>   # resume yourself
 ```
+
+### A ticket stuck "RUNNING" for hours with no progress
+
+`monitor.py` checks the tmux **session** exists and (separately) that the
+`claude` **process** is actually still alive inside it
+(`procs.claude_process_alive`) — an unhandled API error can crash Claude
+Code back to a bare shell prompt while the tmux session itself lives on,
+which without that second check looks identically "RUNNING" to a ticket
+that's genuinely still working. If it's actually dead, `monitor.py` marks
+it `FAILED` and comments on the ticket with the reason — that's the signal
+to check for, not just "still running" in the log forever.
+
+To manually confirm: `tmux capture-pane -t aidev-<KEY> -p -S -30` — a dead
+session shows a bare shell prompt (`$`/`%`) with no Claude Code UI, often
+after an `API Error: Connection refused` or similar line.
+
+**Recovering a FAILED ticket that crashed mid-stage** (not a real bug, just
+lost session): don't restart from `pickup.py` (it skips anything already
+tracked) and don't blindly re-run the whole ticket — if commits already
+landed and pushed before the crash, relaunch at the same stage it died at,
+reusing `monitor.py`'s own `relaunch_for_stage`/prompt builders so the
+resumed session gets the identical prompt a normal transition would have
+built, rather than hand-rolling one:
+
+```python
+from lib import config
+config.CONFIG_PATH = "/Users/talmoskovich/jira-claude-pipeline/config.yaml"
+import monitor
+from lib import state
+
+ticket = state.get("RND-XXXXX")
+# pick the matching prompt_builder for ticket["stage"] (self_review, codex_check,
+# bugbot_check) — see monitor.py's build_*_prompt functions — then:
+monitor.relaunch_for_stage(ticket, ticket["stage"], ticket["pr_url"], prompt_builder,
+    notice="recovering a stalled session — the previous one crashed mid-review")
+```
+
+This also resets `state` back to `RUNNING` (`reopen_for_rework`), so the
+ticket isn't stuck `FAILED` waiting on a human to notice.
