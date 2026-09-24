@@ -792,6 +792,37 @@ def _latest_review_matching(pr_details, marker):
 _BUGBOT_COMMIT_RE = re.compile(r"for commit ([0-9a-f]{7,40})")
 
 
+def build_auto_merge_changelog_prompt(key, summary, pr_url):
+    return f"""{soul_section()}You are handling the changelog enforcer on Jira ticket {key}: {summary}'s
+PR ({pr_url}), as part of an auto-merge sequence. You are in the same
+worktree/branch as before — the existing implementation is already committed
+and pushed. Do NOT start over or create a new branch.
+
+This PR touches source files (.ts/.tsx/.js/.jsx/.css/.scss/.vue/.py) and has
+no changelog entry yet, and is not tagged `no-changelog`. That file-extension
+check is deliberately blunt (it can't tell a real customer-facing change
+from a one-line internal/test/refactor tweak) — use your own judgment on the
+actual diff to decide which this is.
+
+- If this is genuinely customer-facing (a user would notice: new feature,
+  behavior change, bug fix visible in the product, etc.) — add a changelog
+  entry the normal way (`npm run changelog` or equivalent, per this repo's
+  convention — check `.agents/rules/changelog.md` if unsure of the exact
+  format), commit, and push.
+- If it is NOT customer-facing (internal refactor, test-only change, tooling,
+  a fix too small/internal to matter to users) — tag the PR yourself:
+  `gh pr edit {pr_url} --add-label no-changelog`, and briefly note why in a
+  PR comment so a human reviewing later can see the reasoning, not just the
+  label.
+- If you're genuinely unsure which it is, do not guess — print exactly:
+AIDEV_NEEDS_INPUT: <one line: what the change does, why it's ambiguous>
+  and stop.
+
+Otherwise, once you've taken the appropriate action, say exactly:
+AIDEV_TASK_COMPLETE
+"""
+
+
 def _bugbot_review_commit(review):
     """Extracts the commit SHA Bugbot's review body says it reviewed (its
     boilerplate footer: "Reviewed by Cursor Bugbot for commit <sha>."), or
@@ -1043,12 +1074,9 @@ def process_auto_merge_ticket(ticket):
             escalate_auto_merge(ticket, f"could not determine changelog status: {e}")
             return
         if source_change and not has_entry:
-            escalate_auto_merge(
-                ticket,
-                "no changelog entry and this touches source files — not clear whether it's "
-                "customer-facing. Add an entry (`npm run changelog`) or tag the PR `no-changelog` "
-                "yourself if it genuinely isn't, then this will proceed.",
-            )
+            log(f"{key}: auto-merge — no changelog entry, relaunching Claude to judge whether one's needed")
+            relaunch_for_stage(ticket, "auto_merge_changelog", pr_url, build_auto_merge_changelog_prompt,
+                                notice="auto-merge — no changelog entry, judging whether this PR needs one")
             return
 
     # --- approval ---------------------------------------------------------
