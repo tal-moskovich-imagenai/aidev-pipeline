@@ -168,6 +168,28 @@ def _migrate(conn):
         conn.execute("ALTER TABLE tickets ADD COLUMN last_postprocess_error TEXT")
     if "stage" not in cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN stage TEXT NOT NULL DEFAULT 'implement'")
+    if "last_bugbot_trigger_sha" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN last_bugbot_trigger_sha TEXT")
+    if "last_bugbot_trigger_at" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN last_bugbot_trigger_at TEXT")
+
+
+def set_last_bugbot_trigger_sha(ticket_key, sha):
+    """Records the head commit SHA we last sent '@bugbot run' for, plus the
+    timestamp, so process_auto_merge_ticket doesn't re-trigger a fresh
+    Bugbot run every monitor cycle while waiting for the same one to come
+    back — Bugbot can take several minutes, and there is no reason to ask
+    twice for the same commit (caught live on PR #5698/#5700: repeated
+    '@bugbot run' comments piling up across many cycles for what was still
+    the same unreviewed head). The timestamp lets the caller re-trigger
+    after a timeout if Bugbot itself never comes back (errored, rate
+    limited) rather than waiting forever on a SHA match alone."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET last_bugbot_trigger_sha = ?, last_bugbot_trigger_at = datetime('now') "
+            "WHERE ticket_key = ?",
+            (sha, ticket_key),
+        )
 
 
 def set_stage(ticket_key, stage):

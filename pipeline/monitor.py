@@ -735,6 +735,49 @@ not open a new PR), then say exactly: AIDEV_TASK_COMPLETE
 """
 
 
+def build_auto_merge_approval_prompt(key, summary, pr_url, verdict_text):
+    return f"""{soul_section()}You are handling Cursor's Approval Agent verdict on Jira ticket {key}: {summary}'s
+PR ({pr_url}), as part of an auto-merge sequence. You are in the same
+worktree/branch as before — the existing implementation is already committed
+and pushed. Do NOT start over or create a new branch.
+
+Cursor's latest Approval Agent verdict on this PR (NOT an approval):
+---
+{verdict_text}
+---
+
+Use your own judgment reading this verdict, the same way you'd read a human
+reviewer's comment — there is no fixed rule for what this text says, Cursor's
+wording varies run to run. In particular: a human reviewer being assigned to
+the PR (e.g. "reviewers assigned", "reviewers were already assigned") is NOT
+by itself a reason to stop — Cursor itself still approves plenty of PRs that
+have an assigned reviewer (see e.g. PR #5789 for a real example: assigned +
+still approved shortly after on a repeat verdict). Only treat a human
+reviewer as required if the verdict explicitly says human review is
+mandatory/already required with no further automated path (e.g. it names a
+completed/pending human sign-off as the only remaining step, not just that
+someone was tagged in passing).
+
+- If the verdict tells you to run something (the custom-review skill, a
+  fresh Bugbot pass, etc.) and you haven't already done that for the
+  current commit, do it now — the same custom-review/custom-simplify skills
+  from earlier stages are available to you here.
+- If the verdict already reflects work you've done (e.g. you already ran
+  custom-review for this exact commit), or names nothing actionable, just
+  comment `/approve` again to get a fresh verdict.
+- Only if the verdict unambiguously states that a human review is required
+  and already exists/is pending as the sole remaining path (not just "a
+  reviewer is assigned" in passing) — do not comment `/approve` again, and
+  instead print exactly:
+AIDEV_NEEDS_INPUT: <quote the part of the verdict that says human review is required>
+  and stop.
+
+Otherwise, once you've taken whatever action applies (running a skill,
+committing/pushing if you changed anything, commenting `/approve`), say
+exactly: AIDEV_TASK_COMPLETE
+"""
+
+
 def _latest_review_matching(pr_details, marker):
     """Returns the most recent review (by submission order, which is what
     `gh pr view --json reviews` returns) whose body contains `marker`, or
@@ -930,9 +973,22 @@ def process_auto_merge_ticket(ticket):
         return
 
     if not bugbot_clean:
-        log(f"{key}: auto-merge — Bugbot hasn't reviewed the current commit yet, triggering it")
+        already_triggered = ticket.get("last_bugbot_trigger_sha") == head_sha
+        trigger_stale = True
+        if already_triggered and ticket.get("last_bugbot_trigger_at"):
+            try:
+                triggered_at = datetime.strptime(ticket["last_bugbot_trigger_at"], "%Y-%m-%d %H:%M:%S")
+                trigger_stale = (datetime.utcnow() - triggered_at).total_seconds() > 900  # 15 min
+            except ValueError:
+                pass
+        if already_triggered and not trigger_stale:
+            log(f"{key}: auto-merge — already triggered Bugbot for {head_sha[:8]}, waiting for it to come back")
+            return  # give it more time; re-checked next cycle, no re-trigger
+        log(f"{key}: auto-merge — Bugbot hasn't reviewed the current commit yet, triggering it"
+            + (" (re-trigger: no response after 15min)" if already_triggered else ""))
         try:
             github.comment_on_pr(repo_path, pr_url, "@bugbot run")
+            state.set_last_bugbot_trigger_sha(key, head_sha)
         except Exception as e:
             escalate_auto_merge(ticket, f"could not trigger Bugbot: {e}")
         return  # give it time; re-checked next cycle
@@ -995,30 +1051,12 @@ def process_auto_merge_ticket(ticket):
         return
 
     if details.get("reviewRequests"):
-        escalate_auto_merge(
-            ticket,
-            f"human reviewers requested on the PR ({', '.join(r.get('login', '?') for r in details['reviewRequests'])}) "
-            f"— waiting for their approval.",
-            waiting_on_human=True,
-        )
-        return
+        log(f"{key}: auto-merge — reviewer(s) assigned "
+            f"({', '.join(r.get('login', '?') for r in details['reviewRequests'])}), "
+            f"still trying /approve — an assigned reviewer alone doesn't block Cursor's own approval")
 
     latest_approval_verdict = _latest_review_matching(details, "Approval Agent")
     verdict_body = (latest_approval_verdict.get("body") or "") if latest_approval_verdict else ""
-
-    # Cursor's Approval Agent explicitly declining and pointing at human
-    # review (as opposed to "not approving yet, here's what's missing") —
-    # this is its own judgment call (e.g. a PR too large/risky for it to
-    # sign off on), not something fixable by pushing more code. Its
-    # boilerplate always says "No reviewers assigned" when it hasn't
-    # actually deferred, so that phrase rules the deferral reading out.
-    if (
-        latest_approval_verdict
-        and "assign" in verdict_body.lower()
-        and "no reviewers assigned" not in verdict_body.lower()
-    ):
-        escalate_auto_merge(ticket, f"Cursor deferred to human reviewers: {verdict_body[:400]}", waiting_on_human=True)
-        return
 
     last_request = _last_approve_request_time(repo_path, pr_url)
     verdict_is_current = (
@@ -1032,14 +1070,18 @@ def process_auto_merge_ticket(ticket):
         and latest_bugbot.get("submittedAt", "") > latest_approval_verdict.get("submittedAt", "")
     )
     if verdict_is_current and not bugbot_newer_than_verdict:
-        # Already asked since the last relevant change, and got an answer
-        # that was neither APPROVED nor a human-deferral above — it named
-        # something fixable (Bugbot not run/timed out, custom-review
-        # needed) that this same cycle's Bugbot check above should already
-        # be addressing on the next pass. Don't spam another /approve until
-        # something's actually changed — a fresh, newer Bugbot review DOES
-        # count as a change worth re-asking about.
-        log(f"{key}: auto-merge — Cursor has not approved yet: {verdict_body[:200]}")
+        # We already asked since the last relevant change and got a non-approval
+        # answer. Don't parse the wording ourselves (Cursor's phrasing varies
+        # run to run, and a regex here already caused a real miss: "assign" was
+        # meant to catch genuine human-deferral verdicts but also matched
+        # "reviewers will be assigned", which is routine boilerplate, not a
+        # deferral). Hand the verdict text to Claude and let it judge — same
+        # pattern as the Bugbot-findings relaunch above.
+        log(f"{key}: auto-merge — non-approval verdict, relaunching Claude to read and act on it")
+        def approval_prompt_builder(key, summary, pr_url, _text=verdict_body):
+            return build_auto_merge_approval_prompt(key, summary, pr_url, _text)
+        relaunch_for_stage(ticket, "auto_merge_addressing_approval_feedback", pr_url, approval_prompt_builder,
+                            notice="auto-merge — Cursor did not approve, reading its verdict and acting on it")
         return
 
     log(f"{key}: auto-merge — requesting Cursor approval")
