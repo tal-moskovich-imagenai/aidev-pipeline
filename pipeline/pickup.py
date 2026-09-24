@@ -38,7 +38,7 @@ def build_task_prompt(issue, stack_base_key=None):
     key = issue["key"]
     summary = issue["fields"]["summary"]
     base_url = config.load()["jira"]["base_url"]
-    link, context_block = jira_client.build_jira_context_block(key, base_url)
+    link = f"{base_url}/browse/{key}"
     live_fetch_note = jira_live_fetch_note(key, link)
     stack_note = ""
     if stack_base_key:
@@ -68,12 +68,10 @@ relevant), since it's relying on whatever you land.
 Link: {link}
 {stack_note}
 {live_fetch_note}
-Fallback context — description, comments, attachments, dependency links (see live-fetch note above; this is what to use only if the live fetch fails):
-{context_block}
-
 ## Shared context — read before doing anything else, and lives in the repo, not the worktree
 
-The ticket description or comments above may reference "must read" material:
+The ticket description or comments you just fetched may reference "must
+read" material:
 file paths (brainstorm docs, decisions, handoff notes shared across multiple
 related tickets), Notion pages (use the `/notion` skill/slash-command to
 fetch them), Figma links (the Figma MCP is connected — use it to inspect

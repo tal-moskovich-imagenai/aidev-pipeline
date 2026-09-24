@@ -20,48 +20,39 @@ def soul_section():
 
 def jira_live_fetch_note(key, link):
     """Shared instruction, injected into every prompt that references a
-    Jira ticket: tells Claude to independently re-fetch the ticket's full
-    live context — description, comments, attachments/images, blocking
-    links, the wider linked-issue chain, and epic/parent context — rather
-    than trusting only the flattened text embedded below. Explicitly names
-    `imagen-core:jira` as the preferred tool (globally installed,
+    Jira ticket: tells Claude to fetch the ticket's full live context
+    itself — description, comments, attachments/images, blocking links,
+    the wider linked-issue chain, and epic/parent context. Explicitly
+    names `imagen-core:jira` as the preferred tool (globally installed,
     AWS-Secrets-Manager-credentialed via the SessionStart hook already
     configured on this machine — see internal-claude/setup.sh) since it
     fetches richer detail than a raw API call (visually analyzes image
     attachments, not just lists their URLs).
 
-    Why both exist: the embedded text is a deterministic, code-level
-    guarantee that at least a plain-text snapshot of the description and
-    comments is present in the prompt no matter what — it does not depend
-    on Claude remembering a step or a Jira tool actually working in this
-    session. But it is a lossy flatten (no attachments, no images pasted
-    into comments, no linked-issue/epic context, and it can go stale if a
-    comment is edited after this prompt was built). Live-fetching adds
-    that richer, current context on top — it does not replace the
-    guarantee, because a prompt instruction can be skipped under pressure
-    or fail silently if Jira access isn't actually working in this
-    session, and unlike the embedded text that failure would be invisible.
-
-    If the live fetch succeeds, treat it as authoritative over the
-    embedded text below when they disagree (attachments/images especially
-    — the flattening below cannot represent them at all). If the live
-    fetch fails or isn't available in this session for any reason, that's
-    fine — use the embedded text below, but say so explicitly in the PR
-    description or your final summary (e.g. "worked from the pipeline's
-    embedded Jira snapshot; could not independently re-fetch the live
-    ticket in this session") so a human reviewing later knows which source
-    you actually used, not just that Jira context existed somewhere.
+    Deliberately trusts Claude to do this itself rather than the pipeline
+    mechanically pre-fetching and embedding a flattened snapshot in the
+    prompt — an earlier version of this pipeline did both (a deterministic
+    embed as a safety net, plus this instruction on top), but that
+    duplicated the same fetch in two places for no real gain once the
+    instruction here is explicit and complete: it names the exact tool,
+    lists every category to fetch, and says why each matters. If a
+    session's Jira access genuinely isn't working, that's a real failure
+    worth surfacing plainly in the final summary, not something to paper
+    over with a stale fallback snapshot the pipeline built minutes or
+    hours before this session even started, so say so explicitly if that
+    happens (e.g. "could not fetch Jira context this session") rather than
+    quietly proceeding on whatever's already in this prompt's summary/title.
 
     `link` is the same ticket URL already printed elsewhere in the prompt
-    (build_jira_context_block returns it) — passed in rather than
-    re-derived here, so there is exactly one place per prompt that
-    constructs {base_url}/browse/{key}, not two copies that could drift."""
+    (the caller builds it as {base_url}/browse/{key}) — passed in rather
+    than re-derived here, so there is exactly one place per prompt that
+    constructs it, not two copies that could drift."""
     return f"""## Before implementing — re-fetch the live ticket yourself
 
-The fallback context below is a plain-text snapshot the orchestrator took
-when building this prompt — a fallback, not the primary source. Before
-starting real work, independently fetch the FULL live picture of {key}
-yourself:
+This prompt does NOT embed a pre-fetched snapshot of the ticket's
+description/comments — that mechanical fetch was removed as redundant now
+that you're expected to do the live fetch yourself. Before starting real
+work, fetch the FULL live picture of {key} yourself:
 
 - **Preferred tool**: the `imagen-core:jira` skill (invoke via
   `Skill(skill="imagen-core:jira")` — it's globally installed and
@@ -89,9 +80,8 @@ yourself:
     too; the epic often carries the actual goal and constraints an
     individual ticket assumes without repeating.
 
-This snapshot can already be stale (a comment posted after this prompt was
-built, an image attached to a comment, a linked ticket, an edited
-description) — the live fetch is the source of truth if it disagrees with
-what's embedded below. Read {link} for the ticket itself; follow whatever
-links/attachments/epic reference you find from there.
+Read {link} for the ticket itself; follow whatever links/attachments/epic
+reference you find from there. Do this before forming any plan — a
+description alone, without its comments and attachments, is often
+incomplete or stale.
 """

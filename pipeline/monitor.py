@@ -521,7 +521,9 @@ You are in the same worktree and branch as before — the existing implementatio
 is already committed and pushed. Do NOT start over or create a new branch.
 
 {live_fetch_note}
-Reviewer feedback (embedded snapshot — fallback only, see note above):
+This is the specific new feedback that triggered this rework session (detected
+fresh, not a stale snapshot) — but re-fetch the ticket per the note above too,
+in case anything else changed since:
 {feedback}
 
 If the original ticket referenced shared context files (repo root's
