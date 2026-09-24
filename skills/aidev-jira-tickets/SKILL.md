@@ -481,10 +481,33 @@ from lib import state
 
 ticket = state.get("RND-XXXXX")
 # pick the matching prompt_builder for ticket["stage"] (self_review, codex_check,
-# bugbot_check) — see monitor.py's build_*_prompt functions — then:
+# or an auto_merge_* stage) — see monitor.py's build_*_prompt functions — then:
 monitor.relaunch_for_stage(ticket, ticket["stage"], ticket["pr_url"], prompt_builder,
     notice="recovering a stalled session — the previous one crashed mid-review")
 ```
 
 This also resets `state` back to `RUNNING` (`reopen_for_rework`), so the
 ticket isn't stuck `FAILED` waiting on a human to notice.
+
+## Attaching a screenshot (or any file) to a Jira ticket
+
+`jira_client.attach_file(key, file_path)` uploads a local file as a real
+Jira attachment, and `jira_client.get_attachments(key)` lists what's there —
+useful any time a working session needs to actually SEE a screenshot rather
+than read a text description of one (a UI bug ticket you're handing back,
+for instance). Verified live: upload, list via `issue?fields=attachment`,
+and download all confirmed working end to end.
+
+```python
+jira_client.attach_file("RND-XXXXX", "/path/to/screenshot.png")
+jira_client.get_attachments("RND-XXXXX")  # [{id, filename, content: <url>}, ...]
+```
+
+Two gotchas, both already handled inside `attach_file`/verified by hand
+otherwise:
+- The upload needs the `X-Atlassian-Token: no-check` header (Jira's CSRF
+  check otherwise rejects it) — a plain `curl -F file=@...` without it fails
+  silently-ish (a JSON error body, easy to miss).
+- The attachment's `content` URL 303-redirects to the actual file — fetch it
+  with `curl -sL` (or anything that follows redirects by default), not a
+  bare `curl -s`, or you'll get an empty response.
