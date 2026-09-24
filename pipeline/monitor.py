@@ -26,8 +26,18 @@ from lib.soul import soul_section, jira_live_fetch_note
 
 log = get_logger("monitor")
 
-COMPLETE_RE = re.compile(r"(?m)^\s*AIDEV_TASK_COMPLETE\s*$")
-NEEDS_INPUT_RE = re.compile(r"(?m)^\s*AIDEV_NEEDS_INPUT:\s*(.+)$")
+# The interactive Claude Code TUI prefixes every response line with a
+# leading marker glyph + space (e.g. "⏺ AIDEV_TASK_COMPLETE"), not just
+# whitespace like a bare `claude -p` run would — confirmed live on
+# RND-14813, whose session printed the marker correctly but sat
+# undetected for ~25 min across multiple cron cycles because `^\s*` does
+# not match `⏺ `. `[^\w\s]{0,3}\s*` absorbs up to a few leading
+# non-word/non-space decoration characters (covers `⏺`, `>`, `❯`, `-`,
+# bullets in general) before the marker/whitespace, without becoming so
+# permissive it matches the marker appearing mid-sentence in unrelated
+# prose (still requires the rest of the line to be just the marker).
+COMPLETE_RE = re.compile(r"(?m)^[^\w\s]{0,3}\s*AIDEV_TASK_COMPLETE\s*$")
+NEEDS_INPUT_RE = re.compile(r"(?m)^[^\w\s]{0,3}\s*AIDEV_NEEDS_INPUT:\s*(.+)$")
 
 
 def is_complete(pane):
