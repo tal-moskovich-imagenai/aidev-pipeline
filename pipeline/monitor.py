@@ -116,7 +116,7 @@ def mark_failed(key, reason, tmux_name=None):
         log(f"{key}: could not post failure comment: {e}")
     if tmux_name:
         procs.tmux_kill(tmux_name)
-    notify(f"aidev: {key} failed", reason)
+    notify(f"aidev: {key} failed", reason, key=key)
 
 
 def process_running_ticket(ticket):
@@ -173,7 +173,7 @@ def process_running_ticket(ticket):
             jira_client.set_state_label(key, "aidev-stuck")
         except Exception as e:
             log(f"{key}: could not post stuck comment: {e}")
-        notify(f"aidev: {key} needs input", question)
+        notify(f"aidev: {key} needs input", question, key=key, pr_url=ticket.get("pr_url"))
         return
 
     log(f"{key}: still running")
@@ -414,7 +414,8 @@ def mark_review_done(ticket, pr_url, pr_out=None):
     state.set_stage(key, "implement")  # reset for any future rework cycle
     procs.tmux_kill(tmux_name)
     log(f"{key}: done")
-    notify(f"aidev: {key} done", pr_url or "PR step had no URL — check comment")
+    notify(f"aidev: {key} done", "PR opened" if pr_url else "PR step had no URL — check comment",
+           key=key, pr_url=pr_url)
 
 
 def process_stuck_ticket(ticket):
@@ -638,7 +639,7 @@ def process_done_ticket(ticket):
     except Exception as e:
         log(f"{key}: could not post rework comment: {e}")
 
-    notify(f"aidev: {key} rework started", feedback[:200])
+    notify(f"aidev: {key} rework started", feedback[:200], key=key, pr_url=ticket.get("pr_url"))
 
 
 AUTO_MERGE_LABEL = "aidev-auto-merge"
@@ -677,7 +678,8 @@ def escalate_auto_merge(ticket, reason, waiting_on_human=False):
     # caller reached via continue_auto_merge may have come from POSTPROCESS
     # — make sure escalating never silently drops the ticket out of DONE.
     state.set_state(key, "DONE")
-    notify(f"aidev: {key} auto-merge {'waiting on human' if waiting_on_human else 'stuck'}", reason[:200])
+    notify(f"aidev: {key} auto-merge {'waiting on human' if waiting_on_human else 'stuck'}", reason[:200],
+           key=key, pr_url=ticket.get("pr_url"))
 
 
 def build_auto_merge_conflict_prompt(key, summary, pr_url):
@@ -981,7 +983,7 @@ def process_auto_merge_ticket(ticket):
         except Exception as e:
             log(f"{key}: could not post merge comment: {e}")
         state.set_stage(key, "implement")
-        notify(f"aidev: {key} auto-merged", pr_url)
+        notify(f"aidev: {key} auto-merged", "Merged to base branch", key=key, pr_url=pr_url)
         return
 
     if details.get("reviewRequests"):

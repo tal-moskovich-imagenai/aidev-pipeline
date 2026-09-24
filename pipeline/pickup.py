@@ -38,6 +38,22 @@ def build_task_prompt(issue, stack_base_key=None):
     key = issue["key"]
     summary = issue["fields"]["summary"]
     desc = jira_client.plain_description(issue)
+    comments = jira_client.format_comments_for_prompt(key)
+    comments_note = ""
+    if comments:
+        comments_note = f"""
+## Comments on this ticket — READ THESE, they can override the description
+
+The description below may be stale: a human can refine, correct, or reverse
+what it says in a comment posted after the ticket was written (e.g.
+"actually delete this, don't shrink it"). Comments are listed oldest first,
+each with its timestamp and author. If a comment conflicts with the
+description, the comment wins — it is the more recent, more specific
+instruction. Read every comment before starting implementation, not just
+the description.
+
+{comments}
+"""
     stack_note = ""
     if stack_base_key:
         stack_note = f"""
@@ -66,7 +82,7 @@ relevant), since it's relying on whatever you land.
 {stack_note}
 Description:
 {desc or '(no description provided)'}
-
+{comments_note}
 ## Shared context — read before doing anything else, and lives in the repo, not the worktree
 
 The ticket description or comments above may reference "must read" material:

@@ -308,3 +308,29 @@ def plain_description(issue):
         return out
 
     return "".join(walk(desc)).strip()
+
+
+def format_comments_for_prompt(key):
+    """Fetch and flatten all comments on a ticket into plain text, oldest
+    first, each tagged with its author and timestamp. Comments are where a
+    human most often refines or overrides what the description says after
+    the ticket was written or picked up — pickup.py's search_issues() call
+    does not fetch the comment field by default, so callers that need the
+    full picture (build_task_prompt) must fetch this separately, not assume
+    the description alone is authoritative. Skips the pipeline's own
+    [aidev]/✅ status comments (see set_state_label callers) — those are
+    noise here, not human instructions."""
+    comments = get_comments(key)
+    if not comments:
+        return ""
+    blocks = []
+    for c in comments:
+        body = plain_description({"fields": {"description": c.get("body")}})
+        if not body.strip():
+            continue
+        if body.strip().startswith("[aidev]") or body.strip().startswith("🤖") or body.strip().startswith("✅"):
+            continue
+        author = c.get("author", {}).get("displayName", "unknown")
+        created = c.get("created", "")
+        blocks.append(f"[{created} — {author}]\n{body.strip()}")
+    return "\n\n".join(blocks)
