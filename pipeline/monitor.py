@@ -744,6 +744,43 @@ def _bugbot_review_commit(review):
     return m.group(1) if m else None
 
 
+_REVIEW_PASS_COMMIT_RE = re.compile(r"commits? (?:up to )?\b([0-9a-f]{7,40})\b")
+
+
+def _custom_review_covers_head(repo_path, pr_url, branch, head_sha):
+    """The `ai-reviewed` label (unlike Bugbot's review comment) carries no
+    commit SHA — GitHub labels aren't tied to a commit, so once applied it
+    stays applied forever even after new commits land (e.g. a conflict
+    resolution push in the middle of an auto-merge run). Caught live: Cursor's
+    own Approval Agent correctly refused to approve a PR with a stale
+    `ai-reviewed` label and asked for /custom-review to be re-run — this
+    mirrors that same judgment in our own gate instead of trusting the label
+    alone.
+
+    Finds our own last "aidev decisions: ... commit(s) [up to] <sha>" PR
+    comment (posted by the self_review/codex_check prompts) and requires
+    that reviewed commit to be EXACTLY the PR's current head — not merely an
+    ancestor of it. Ancestor-or-equal would be backwards here: if the
+    reviewed commit is an ancestor of head, head necessarily has MORE,
+    unreviewed commits on top of it (e.g. this same auto-merge run's own
+    conflict-resolution push) — that's precisely the stale case, not a
+    covered one. No matching comment counts as NOT covering head —
+    conservative by design, a false "needs re-review" is cheap (one extra
+    Claude pass) but a false "clean" would ship an unreviewed commit."""
+    if not head_sha:
+        return False
+    comments = github.get_pr_comments(repo_path, pr_url)
+    review_comments = [c for c in comments if (c.get("body") or "").startswith("**aidev decisions")]
+    if not review_comments:
+        return False
+    last = review_comments[-1]
+    m = _REVIEW_PASS_COMMIT_RE.search(last.get("body") or "")
+    if not m:
+        return False
+    reviewed_sha = m.group(1)
+    return head_sha.startswith(reviewed_sha)
+
+
 def _last_approve_request_time(repo_path, pr_url):
     """Returns the createdAt of the most recent `/approve` PR comment (ours
     or anyone's — only aidev and humans post this convention), or None if
@@ -892,6 +929,13 @@ def process_auto_merge_ticket(ticket):
             ticket,
             f"PR missing the '{REQUIRED_LABEL}' label — /custom-review may not have run. Not safe to auto-merge without it.",
         )
+        return
+
+    if not _custom_review_covers_head(repo_path, pr_url, branch, details.get("headRefOid", "")):
+        log(f"{key}: auto-merge — '{REQUIRED_LABEL}' label is stale (commits landed since the "
+            f"last /custom-review pass, e.g. a conflict-resolution push) — re-running review")
+        relaunch_for_stage(ticket, "auto_merge_recheck", pr_url, build_self_review_prompt,
+                            notice="auto-merge — re-running /custom-review, PR changed since the last pass")
         return
 
     if not _required_checks_green(details):
