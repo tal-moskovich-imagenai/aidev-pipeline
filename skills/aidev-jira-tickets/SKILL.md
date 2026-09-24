@@ -272,10 +272,15 @@ order.
 | In Progress  | `aidev-picked` | Claude Code is actively working in a worktree |
 | In Progress  | `aidev-stuck`  | Claude asked a question, waiting on your reply comment |
 | In Review    | `aidev-done`   | PR opened, ready for human review |
+| Done         | (none)         | You merged it (manually), or `aidev-auto-merge` did |
 
 Don't manually set these labels — they're mutually exclusive and managed by
 `pickup.py`/`monitor.py` via `jira_client.set_state_label()`. Manually editing
 status while a ticket is `RUNNING` in the pipeline's state DB can desync it.
+
+`aidev-auto-merge` is a separate, opt-in label you add yourself — not part of
+this managed set, not mutually exclusive with `aidev-done` (it's meant to sit
+alongside it). See "Auto-merge a stacked PR chain" below.
 
 ## Review feedback loop
 
@@ -360,8 +365,81 @@ jira_client.transition_issue("RND-XXXXX", "In Progress")
   fix-versions — only explicit "Blocks"/"is blocked by" issue links.
 - It does not re-order or prioritize tickets — `pickup.py` processes whatever
   the JQL query returns, blockers permitting.
-- It does not merge PRs — a human reviews and merges.
-- It does not resolve merge conflicts with the base branch automatically.
+- It does not merge PRs or resolve merge conflicts on its own initiative —
+  only when a ticket is explicitly tagged `aidev-auto-merge` (see below),
+  and only after you've already reviewed and are satisfied with the code.
+  Without that label, a human reviews and merges, same as always.
+
+## Auto-merge a stacked PR chain
+
+Tag a ticket **already `In Review` + `aidev-done`** — i.e. you've reviewed
+the code and are satisfied with it — with the label `aidev-auto-merge`, and
+`monitor.py`'s DONE-ticket sweep (`process_auto_merge_ticket`) walks its PR
+to master unattended, re-checked every cycle:
+
+1. **Base must be `master`.** A PR still stacked on another `aidev/*` branch
+   is skipped (not touched) until its base auto-retargets to master, which
+   GitHub does once the branch below it merges. This is what makes tagging a
+   whole stacked chain work: tag every ticket in the chain up front, same as
+   tagging `aidev` itself on a dependency chain — each one starts its own
+   sequence only once it's genuinely next in line, bottom-up, with no
+   explicit cascade logic needed.
+2. **Merge conflict** → relaunches Claude (same mechanism as the review
+   feedback loop) to resolve it, verify via typecheck, commit, push. A
+   semantically ambiguous conflict prints `AIDEV_NEEDS_INPUT` and the ticket
+   goes `STUCK` like any other — same reply-on-Jira-to-resume flow.
+3. **Bugbot** — `@bugbot run`, wait, relaunch Claude to fix real findings if
+   any, loop until clean. This is the ONLY place Bugbot runs in the whole
+   pipeline now — it moved here from every review pass specifically because
+   a PR can sit in human review for a long time, and re-running Bugbot on
+   the same already-reviewed commit at both self_review and merge time was
+   pure waste.
+4. **Gates**: `ai-reviewed` label present, every required CI check green,
+   and a changelog entry OR the `no-changelog` label — self-heals the
+   changelog check by diffing against master for source-file changes; if
+   that's genuinely ambiguous (touches source, no entry, no label) it
+   escalates rather than guessing whether it's customer-facing.
+5. **`/approve`** — the real convention here (verified against actual merged
+   PRs), NOT a fiction: commenting it triggers Cursor's own "Approval Agent"
+   automation, which posts a genuine GitHub review — `APPROVED` when its own
+   bar is met, `COMMENTED` with a verdict otherwise. `AIDEV_NEEDS_INPUT`
+   doesn't apply here; this step polls and reads Cursor's own text the same
+   non-deterministic way SOUL.md already treats Bugbot — no regex-matching
+   its wording, just reading the verdict.
+6. **Three outcomes from Cursor's verdict**, not two:
+   - **`APPROVED`** → merge (see step 7).
+   - **Fixable** (e.g. "Bugbot hasn't run on the latest commit") → the
+     Bugbot loop above should already be addressing it; re-requests
+     `/approve` once a newer Bugbot pass lands after the stale verdict.
+   - **Explicit human-reviewer deferral** (Cursor's own risk/size judgment —
+     e.g. too large a PR for it to sign off on, distinguished from its
+     routine "no reviewers assigned" boilerplate by the actual comment
+     text) → this is NOT retried or fixed automatically. The ticket pauses
+     with a Jira comment explaining why, stays `DONE`, and is re-checked
+     every cycle — the moment a real human `APPROVED` review lands on the
+     PR (from anyone, not necessarily the person Cursor named), it resumes
+     and merges on its own. This is a genuine wait, not a dead end.
+7. **Merge**: `gh pr merge --merge` — a real merge commit, verified against
+   how every actual aidev PR to date has been merged here. Never
+   `--squash`, never `--rebase`.
+8. **Success** → Jira ticket transitions to `Done`, with a comment linking
+   the merge. **Any other failure** (the merge call itself fails
+   unexpectedly, no PR URL recorded, etc.) removes the `aidev-auto-merge`
+   label and comments why — re-tag once addressed to retry, same as tagging
+   a ticket in the first place.
+
+**Everything self-heals except a genuine judgment call.** Conflicts get
+resolved, Bugbot findings get fixed, changelog entries get written — the
+only things that actually pause the sequence are Cursor deferring to a human
+reviewer (waits, keeps checking) or something structurally broken (removes
+the label, tells you why). Never silently drops a stuck ticket without a
+Jira comment explaining what's blocking it.
+
+**Never acts on running work.** Before doing anything, re-verifies the
+ticket's actual Jira status is `In Review` with the `aidev-done` label — not
+just that the local state DB says `DONE` — so a ticket mid-rework or
+otherwise not genuinely finished is never touched even if `aidev-auto-merge`
+was tagged on it by mistake.
 
 ## Checking pipeline state
 
