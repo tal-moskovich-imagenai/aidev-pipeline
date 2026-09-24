@@ -56,7 +56,7 @@ def get_pr_details(repo_path, pr_url):
     not as a terminal condition."""
     if not pr_url:
         return None
-    fields = "baseRefName,number,labels,mergeable,mergeStateStatus,statusCheckRollup,reviews,reviewRequests"
+    fields = "baseRefName,number,headRefOid,labels,mergeable,mergeStateStatus,statusCheckRollup,reviews,reviewRequests"
     out = procs.sh(f"gh pr view {procs.shlex.quote(pr_url)} --json {fields}", cwd=repo_path, check=False)
     if not out:
         return None

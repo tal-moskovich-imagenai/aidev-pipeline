@@ -731,6 +731,19 @@ def _latest_review_matching(pr_details, marker):
     return matches[-1] if matches else None
 
 
+_BUGBOT_COMMIT_RE = re.compile(r"for commit ([0-9a-f]{7,40})")
+
+
+def _bugbot_review_commit(review):
+    """Extracts the commit SHA Bugbot's review body says it reviewed (its
+    boilerplate footer: "Reviewed by Cursor Bugbot for commit <sha>."), or
+    None if not found."""
+    if not review:
+        return None
+    m = _BUGBOT_COMMIT_RE.search(review.get("body") or "")
+    return m.group(1) if m else None
+
+
 def _last_approve_request_time(repo_path, pr_url):
     """Returns the createdAt of the most recent `/approve` PR comment (ours
     or anyone's — only aidev and humans post this convention), or None if
@@ -834,11 +847,27 @@ def process_auto_merge_ticket(ticket):
     # --- bugbot loop ------------------------------------------------------
     # Bugbot's own "clean" marker text, and its "real findings" text, both
     # live in the comment body — see SOUL.md's Cursor Bugbot section for the
-    # exact conventions this mirrors.
+    # exact conventions this mirrors. A "clean" review only counts if it was
+    # actually run against the PR's CURRENT head commit — Bugbot's review
+    # comment embeds the SHA it reviewed ("...for commit <sha>."), and a
+    # push since then (e.g. this same sequence's own conflict-resolution
+    # commit) makes an old clean verdict stale and worthless as a safety
+    # check. Without this, a real bug: resolving a conflict, pushing a new
+    # commit, then treating yesterday's "clean" Bugbot review of the
+    # pre-conflict-fix commit as still valid.
+    head_sha = details.get("headRefOid", "")
     latest_bugbot = _latest_review_matching(details, "BUGBOT_REVIEW")
-    bugbot_clean = bool(latest_bugbot) and "found no new issues" in (latest_bugbot.get("body") or "").lower()
+    bugbot_reviewed_current_head = (
+        bool(latest_bugbot)
+        and bool(head_sha)
+        and head_sha.startswith(_bugbot_review_commit(latest_bugbot) or "\0")
+    )
+    bugbot_clean = (
+        bugbot_reviewed_current_head
+        and "found no new issues" in (latest_bugbot.get("body") or "").lower()
+    )
     bugbot_findings_text = (
-        latest_bugbot.get("body") if latest_bugbot and not bugbot_clean else None
+        latest_bugbot.get("body") if bugbot_reviewed_current_head and not bugbot_clean else None
     )
     if bugbot_findings_text:
         log(f"{key}: auto-merge — Bugbot left findings, relaunching Claude to address them")
