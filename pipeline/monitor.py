@@ -856,7 +856,7 @@ def build_auto_merge_ci_failure_prompt(key, summary, pr_url, failed_checks):
     )
     changelog_hint = ""
     if any("changelog" in (c.get("name") or "").lower() for c in failed_checks):
-        changelog_hint = """
+        changelog_hint = f"""
 Note: the "changelog" check is failing. That one specifically means this PR
 touches source files with no changelog entry and isn't tagged `no-changelog`.
 Use your own judgment on the actual diff: if the change is genuinely
