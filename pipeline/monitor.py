@@ -567,7 +567,6 @@ def gather_rework_feedback(ticket):
     `@bugbot run` trigger comment or a CI bot post doesn't masquerade as
     human feedback."""
     key = ticket["ticket_key"]
-    since = ticket.get("updated_at")  # last time this ticket's state changed (i.e. went DONE)
 
     jira_feedback = None
     try:
@@ -584,26 +583,25 @@ def gather_rework_feedback(ticket):
     try:
         pr_comments = github.get_pr_comments(ticket["repo_path"], ticket.get("pr_url"))
         bot_authors = {"github-actions", "cursor", "cursor-ai", "dependabot", "sonarqubecloud"}
-        since_dt = None
-        if since:
-            try:
-                since_dt = datetime.strptime(since, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                pass
+        # No time-window filter here on purpose: `since` (this ticket's DB
+        # updated_at, i.e. when it last flipped to DONE) is not reliable as
+        # a "before this = already seen" boundary — a human comment posted
+        # while a self-review session is still running lands BEFORE that
+        # session later sets DONE, so a `created_at <= since` cutoff would
+        # silently exclude it forever (confirmed live on RND-14814/PR #5802:
+        # a comment at 19:41 was swallowed because DONE didn't land until
+        # 19:58). Scanning newest-first and taking the first non-bot,
+        # non-self-authored comment is enough on its own — this function
+        # only runs at all when a human has already moved the ticket back
+        # to in_progress_status, so there is always genuinely something to
+        # look for, and picking up an older still-unaddressed comment here
+        # is correct behavior, not a false trigger.
         for c in reversed(pr_comments):
             author = (c.get("author") or {}).get("login", "")
             body = (c.get("body") or "").strip()
-            created_at = c.get("createdAt", "")
-            if since_dt and created_at:
-                try:
-                    created_dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
-                    if created_dt <= since_dt:
-                        break  # comments come oldest-first; nothing older is new
-                except ValueError:
-                    pass  # unparseable timestamp — don't skip on the strength of a bad date
             if author.lower() in bot_authors:
                 continue
-            if body.startswith("**aidev decisions") or body.startswith("@bugbot"):
+            if body.startswith(("**aidev decisions", "## aidev decisions", "## Decisions log", "Decisions log")) or body.startswith("@bugbot"):
                 continue
             if not body:
                 continue
