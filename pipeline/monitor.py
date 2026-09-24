@@ -792,37 +792,6 @@ def _latest_review_matching(pr_details, marker):
 _BUGBOT_COMMIT_RE = re.compile(r"for commit ([0-9a-f]{7,40})")
 
 
-def build_auto_merge_changelog_prompt(key, summary, pr_url):
-    return f"""{soul_section()}You are handling the changelog enforcer on Jira ticket {key}: {summary}'s
-PR ({pr_url}), as part of an auto-merge sequence. You are in the same
-worktree/branch as before — the existing implementation is already committed
-and pushed. Do NOT start over or create a new branch.
-
-This PR touches source files (.ts/.tsx/.js/.jsx/.css/.scss/.vue/.py) and has
-no changelog entry yet, and is not tagged `no-changelog`. That file-extension
-check is deliberately blunt (it can't tell a real customer-facing change
-from a one-line internal/test/refactor tweak) — use your own judgment on the
-actual diff to decide which this is.
-
-- If this is genuinely customer-facing (a user would notice: new feature,
-  behavior change, bug fix visible in the product, etc.) — add a changelog
-  entry the normal way (`npm run changelog` or equivalent, per this repo's
-  convention — check `.agents/rules/changelog.md` if unsure of the exact
-  format), commit, and push.
-- If it is NOT customer-facing (internal refactor, test-only change, tooling,
-  a fix too small/internal to matter to users) — tag the PR yourself:
-  `gh pr edit {pr_url} --add-label no-changelog`, and briefly note why in a
-  PR comment so a human reviewing later can see the reasoning, not just the
-  label.
-- If you're genuinely unsure which it is, do not guess — print exactly:
-AIDEV_NEEDS_INPUT: <one line: what the change does, why it's ambiguous>
-  and stop.
-
-Otherwise, once you've taken the appropriate action, say exactly:
-AIDEV_TASK_COMPLETE
-"""
-
-
 def _bugbot_review_commit(review):
     """Extracts the commit SHA Bugbot's review body says it reviewed (its
     boilerplate footer: "Reviewed by Cursor Bugbot for commit <sha>."), or
@@ -879,41 +848,74 @@ def _last_approve_request_time(repo_path, pr_url):
     return approve_comments[-1]["createdAt"] if approve_comments else None
 
 
-def _required_checks_green(pr_details):
-    """True only if every non-skipped check succeeded. A check still
-    queued/pending is treated as not-yet-green (retry next cycle), not as a
-    failure — only an explicit failing conclusion blocks."""
+def build_auto_merge_ci_failure_prompt(key, summary, pr_url, failed_checks):
+    checks_block = "\n".join(
+        f"- {c['name']}: {c.get('conclusion') or c.get('status') or 'unknown'}"
+        + (f" ({c['detailsUrl']})" if c.get("detailsUrl") else "")
+        for c in failed_checks
+    )
+    changelog_hint = ""
+    if any("changelog" in (c.get("name") or "").lower() for c in failed_checks):
+        changelog_hint = """
+Note: the "changelog" check is failing. That one specifically means this PR
+touches source files with no changelog entry and isn't tagged `no-changelog`.
+Use your own judgment on the actual diff: if the change is genuinely
+customer-facing, add a real entry (`npm run changelog` or equivalent, check
+`.agents/rules/changelog.md` if unsure of format); if it's internal/test/
+tooling-only and too small to matter to users, tag the PR yourself
+(`gh pr edit {pr_url} --add-label no-changelog`) with a one-line reason in a
+PR comment. Don't guess if it's genuinely ambiguous — see below.
+"""
+    return f"""{soul_section()}You are addressing failing CI checks on Jira ticket {key}: {summary}'s
+PR ({pr_url}), as part of an auto-merge sequence. You are in the same
+worktree/branch as before — the existing implementation is already committed
+and pushed. Do NOT start over or create a new branch.
+
+These checks are currently failing (red, not just pending):
+{checks_block}
+{changelog_hint}
+Use your own judgment, the same way you would investigate any CI failure —
+read the actual failure output (`gh run view` / the check's details URL,
+whatever applies) before touching anything. Common cases:
+- A genuine test/lint/type failure caused by your own change — fix it.
+- A flaky/unrelated failure (infra hiccup, a pre-existing failure on master
+  unrelated to this diff) — do not just retry blindly; if you're confident
+  it's unrelated, note that in a PR comment and leave it, since re-triggering
+  a workflow run isn't necessarily something you can do from here.
+- The changelog check — see the note above.
+
+If you fix something, commit and push to the existing branch (this updates
+the existing PR — do not open a new PR). If you're genuinely unsure what a
+failure means or how to address it, do not guess — print exactly:
+AIDEV_NEEDS_INPUT: <one line: which check, what's unclear>
+and stop.
+
+Otherwise, once you've taken whatever action applies, say exactly:
+AIDEV_TASK_COMPLETE
+"""
+
+
+def _classify_checks(pr_details):
+    """Splits statusCheckRollup into (red, pending) — green/skipped/neutral
+    checks are dropped entirely, they need no action. A check with no
+    conclusion yet (still running/queued) is pending, not failing — this
+    pipeline should never treat "not done yet" as "broken"; only an
+    explicit non-success conclusion counts as red and worth Claude's
+    attention."""
+    red, pending = [], []
     for c in pr_details.get("statusCheckRollup", []):
-        conclusion = (c.get("conclusion") or c.get("state") or "").upper()
-        if conclusion in ("SKIPPED", "NEUTRAL"):
+        conclusion = (c.get("conclusion") or "").upper()
+        status = (c.get("status") or "").upper()
+        if conclusion in ("SUCCESS", "SKIPPED", "NEUTRAL"):
             continue
-        if conclusion not in ("SUCCESS",):
-            return False
-    return True
-
-
-def _has_changelog_entry(repo_path, branch, base):
-    """True if the branch adds a file under changelogs/*/unreleased/, or
-    edits a legacy changelogs/*/CHANGELOG.md directly (see
-    .agents/rules/changelog.md — both satisfy the enforcer)."""
-    diff = procs.sh(
-        f"git diff --name-only {procs.shlex.quote(base)}...{procs.shlex.quote(branch)}",
-        cwd=repo_path, check=False,
-    )
-    for line in diff.splitlines():
-        if re.match(r"^changelogs/[^/]+/unreleased/.+\.md$", line):
-            return True
-        if re.match(r"^changelogs/[^/]+/CHANGELOG\.md$", line):
-            return True
-    return False
-
-
-def _looks_like_source_change(repo_path, branch, base):
-    diff = procs.sh(
-        f"git diff --name-only {procs.shlex.quote(base)}...{procs.shlex.quote(branch)}",
-        cwd=repo_path, check=False,
-    )
-    return any(re.search(r"\.(ts|tsx|js|jsx|css|scss|vue|py)$", line) for line in diff.splitlines())
+        if not conclusion and status and status != "COMPLETED":
+            pending.append(c)
+            continue
+        if conclusion in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+            red.append(c)
+        else:
+            pending.append(c)
+    return red, pending
 
 
 def process_auto_merge_ticket(ticket):
@@ -1062,22 +1064,26 @@ def process_auto_merge_ticket(ticket):
                             notice="auto-merge — re-running /custom-review, PR changed since the last pass")
         return
 
-    if not _required_checks_green(details):
-        log(f"{key}: auto-merge — required checks not all green yet, waiting")
+    # --- CI checks: red is Claude's to judge, yellow is just a wait ------
+    # No hardcoded "changelog specifically means X" branch here — a check
+    # being red (failing tests, lint, changelog enforcer, anything) is not
+    # automatically "stuck"; Claude reads the actual failures and decides
+    # what to do, same non-deterministic pattern as the Bugbot/approval
+    # gates. Only a check still queued/running is a genuine "wait, not
+    # broken" — never treated as needing Claude's attention.
+    red_checks, pending_checks = _classify_checks(details)
+    if red_checks:
+        log(f"{key}: auto-merge — {len(red_checks)} check(s) red "
+            f"({', '.join(c['name'] for c in red_checks)}), relaunching Claude to judge them")
+        def ci_prompt_builder(key, summary, pr_url, _checks=red_checks):
+            return build_auto_merge_ci_failure_prompt(key, summary, pr_url, _checks)
+        relaunch_for_stage(ticket, "auto_merge_fixing_ci", pr_url, ci_prompt_builder,
+                            notice=f"auto-merge — {len(red_checks)} CI check(s) red, judging and addressing them")
         return
-
-    if "no-changelog" not in label_names:
-        try:
-            has_entry = _has_changelog_entry(repo_path, branch, "master")
-            source_change = _looks_like_source_change(repo_path, branch, "master")
-        except Exception as e:
-            escalate_auto_merge(ticket, f"could not determine changelog status: {e}")
-            return
-        if source_change and not has_entry:
-            log(f"{key}: auto-merge — no changelog entry, relaunching Claude to judge whether one's needed")
-            relaunch_for_stage(ticket, "auto_merge_changelog", pr_url, build_auto_merge_changelog_prompt,
-                                notice="auto-merge — no changelog entry, judging whether this PR needs one")
-            return
+    if pending_checks:
+        log(f"{key}: auto-merge — {len(pending_checks)} check(s) still running "
+            f"({', '.join(c['name'] for c in pending_checks)}), waiting")
+        return
 
     # --- approval ---------------------------------------------------------
     approved = any(r.get("state") == "APPROVED" for r in details.get("reviews", []))
