@@ -26,6 +26,7 @@ pipeline/               the actual orchestrator (Python, stdlib-only + PyYAML)
   monitor.py              watches running/stuck sessions, opens PRs, relays replies
   status.py               CLI status table
   config.yaml.example     copy to config.yaml (gitignored) and fill in
+  webui/                  web dashboard — see "Web dashboard" below
 
 skills/
   aidev-jira-tickets/     Claude Code skill: how to write tickets for this pipeline
@@ -66,15 +67,29 @@ Two independent loops, meant to run on a schedule (cron):
   still blocked by an unresolved Jira "Blocks" link), launches worktree +
   tmux + Claude Code, comments worktree/session info back, labels
   `aidev-picked`.
-- `python3 monitor.py` — watches `RUNNING` tickets for the `AIDEV_TASK_COMPLETE`
-  marker (opens a PR, labels `aidev-done`) or an `AIDEV_NEEDS_INPUT: <question>`
-  marker (posts the question, labels `aidev-stuck`); also watches `STUCK`
+- `python3 monitor.py` — watches `RUNNING` tickets' `.claude-code/status.json`
+  for state `complete` (opens a PR, labels `aidev-done`) or `needs_input`
+  (posts the `detail` question, labels `aidev-stuck`); also watches `STUCK`
   tickets for a human reply comment and relays it back into the live tmux
   session automatically.
 
 Suggested cadence: pickup.py every 5 min, monitor.py every 2-3 min.
 
 `python3 status.py` — quick table of all tracked tickets and their state.
+
+## Web dashboard
+
+`pipeline/webui/start.sh [port]` (default 8765) starts a small web
+dashboard at `http://127.0.0.1:<port>/` — same real state (DB + live Jira +
+live GitHub PR checks) as `status.py`, plus action buttons: promote to
+review, send to rework (with an optional note posted to the PR/Jira),
+tag/untag `aidev-auto-merge`/`aidev-codex-review`, merge a PR, recover a
+crashed ticket (same restore-state pattern used manually throughout
+development), archive. No third-party deps — stdlib `http.server` only,
+but **must run under `/usr/bin/python3`** (has PyYAML); Homebrew's
+`python3` doesn't. Polls every 6s; server-side caches Jira/GitHub reads
+for 8s so rapid polling doesn't hammer either API. If it's not responding,
+just re-run `start.sh` — it kills any stale instance on that port first.
 
 ## Scheduling
 

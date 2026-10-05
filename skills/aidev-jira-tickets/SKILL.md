@@ -8,7 +8,7 @@ description: Read before creating or tagging a Jira ticket for the aidev pipelin
 The **aidev pipeline** (code in this repo under `pipeline/`, deployed at
 `~/jira-claude-pipeline` on this machine) polls Jira for tickets labeled
 `aidev` and runs them end-to-end through Claude Code: git worktree →
-implementation → `/simplify` → `/custom-simplify` → `/custom-review` → commit
+implementation → the configured review skill (`claude.review_skill`: simplify → review → fixes → CI) → commit
 → PR → Jira comment/status update. No human types anything unless the ticket
 is genuinely ambiguous.
 
@@ -104,7 +104,12 @@ Whichever you pick, it must stay **outside `worktree_root`** in
 **What the pipeline does with this (already built into the task prompt, no
 extra setup needed):**
 - The agent is instructed to read every referenced file/link in full before
-  implementing anything.
+  implementing anything — this still applies to ticket-specific
+  docs/Notion/Figma/Slack links referenced this way. The one narrower
+  exception is an *ancestor* stacked ticket's own diff/PR (see "Stacking on
+  a blocker that's only In Review" below): the agent checks the shared epic
+  doc's per-ticket section first and only pulls the ancestor's actual
+  diff/PR on demand, if that section doesn't answer a specific question.
 - Notion links are fetched via the `/notion` skill. Figma links are fetched
   via the connected **Figma MCP** — the agent can inspect designs/frames
   directly. Slack links are fetched via the connected **Slack MCP** — the
@@ -112,16 +117,20 @@ extra setup needed):**
   fetch. All three are live integrations in this Claude Code setup, not
   best-effort guesses.
 - Local `.md` files referenced this way are treated as **living, shared
-  documents** — the agent appends new decisions/findings to them (in a
-  dated/labeled section, following the file's existing style) rather than
-  treating them as private scratch space. This is exactly the "Decisions
-  taken while implementing" pattern already used in hand-written docs like
-  `jxl-highres-upload-decisions.md` — the pipeline just continues that
-  pattern automatically, across however many tickets share the same file.
-  Existing content is never overwritten or rewritten, only appended to.
+  documents**. For the shared epic doc specifically, each ticket owns its
+  own `## TICKET-KEY` section (up to 10 bullets: what changed, why,
+  anything the next ticket needs to know) and **overwrites that whole
+  section in place** if it re-touches the doc (e.g. after rework) — it does
+  not append a second copy of its own section, and never touches another
+  ticket's section. This keeps the doc bounded across a long epic instead
+  of growing forever. This is the evolution of the "Decisions taken while
+  implementing" pattern already used in hand-written docs like
+  `jxl-highres-upload-decisions.md` — same living-document idea, now with
+  an explicit per-ticket-section-replaced-in-place convention rather than
+  unbounded append.
 - The same instruction applies during the review-feedback rework loop (see
   below) — the agent re-checks referenced context if relevant to the
-  feedback and keeps appending to it.
+  feedback and keeps its own epic-doc section current.
 
 **Why this stays safe automatically:** every location recommended above —
 the main checkout's `.claude-code/`, `/tmp`, another tool's worktree — sits
@@ -141,11 +150,12 @@ repo-relative one, even for a doc that lives in the same repo.
 
 If a ticket is inherently ambiguous (a product decision, a design choice with
 no clear default), still tag it `aidev` — the pipeline instructs Claude to
-print `AIDEV_NEEDS_INPUT: <question>` and post it as a Jira comment instead of
-guessing. Reply on the ticket with a normal comment; the pipeline detects it
-and resumes the same Claude Code session automatically. But don't rely on this
-for routine ambiguity — a ticket that triggers `AIDEV_NEEDS_INPUT` for
-something you could have just stated up front wastes a full pipeline cycle.
+write `.claude-code/status.json` with `state: "needs_input"` and post the
+`detail` text as a Jira comment instead of guessing. Reply on the ticket with
+a normal comment; the pipeline detects it and resumes the same Claude Code
+session automatically. But don't rely on this for routine ambiguity — a
+ticket that triggers a needs_input round-trip for something you could have
+just stated up front wastes a full pipeline cycle.
 
 ## Dependency chains (epics / sequenced tickets)
 
@@ -229,6 +239,14 @@ is expected, not a mistake to undo.
 - A **hard** blocker (any status other than terminal or `review_status`)
   still blocks unconditionally — stacking only changes the "In Review isn't
   merged yet" case, not "still New"/"In Progress" ones.
+- **A soft blocker in a different repo isn't a blocker at all.** A Jira
+  "blocks" link has no notion of repo — two tickets can be linked while
+  their actual code lives in entirely separate repos. Stacking only makes
+  sense when there's a real branch in the SAME repo to build on, so a
+  cross-repo soft blocker (checked via the blocker's tracked `repo_path` or
+  its own `repo:` label) is dropped from consideration before stacking is
+  even attempted — the current ticket proceeds against its normal base as
+  if that blocker didn't exist, not skipped and not stacked.
 
 **Consequence you must handle manually:** a stacked PR is not runnable in
 isolation — it needs its base to merge (or be rebased onto whatever actually
@@ -274,6 +292,22 @@ order.
 | In Review    | `aidev-done`   | PR opened, ready for human review |
 | Done         | (none)         | You merged it (manually), or `aidev-auto-merge` did |
 
+Two more, orthogonal to the status column above (self-consuming review-depth
+tags, not state labels — can coexist with any row above):
+
+| Jira label            | Meaning |
+|------------------------|---------|
+| `aidev-self-review`    | Applied automatically at pickup time (`claude.auto_review: true` in config.yaml, on by default). Present → self_review runs once after implement, then the tag is removed. Absent → self_review is skipped entirely and the ticket goes straight to the codex-review check. |
+| `aidev-codex-review`   | Checked after self_review runs (or right after implement, if self_review was skipped). Present → Codex runs once as a second-opinion reviewer, then the tag is removed. Absent → Codex is skipped, straight to human review. Not auto-applied on pickup — add it yourself (or have the agent re-add it) if you want another Codex pass, e.g. after a substantial rework. |
+
+Both tags are removed only after their stage actually completes — a crash
+mid-stage leaves the tag in place, so the next `monitor.py` sweep simply
+retries; presence/absence of the tag IS the retry state, no separate counter.
+If both review tags are absent and `aidev-auto-merge` isn't set either, the
+ticket goes straight to normal human-review handoff with no stages run
+automatically — this is the explicit default when no tags are present, not
+an implicit no-op.
+
 Don't manually set these labels — they're mutually exclusive and managed by
 `pickup.py`/`monitor.py` via `jira_client.set_state_label()`. Manually editing
 status while a ticket is `RUNNING` in the pipeline's state DB can desync it.
@@ -290,24 +324,37 @@ makes that call. If a PR needs changes after review:
 1. Move the ticket's status back to `In Progress` — that's the actual
    trigger `monitor.py` watches for.
 2. Leave a comment with the feedback, **on either the Jira ticket or the PR
-   on GitHub** — `gather_rework_feedback()` reads both sources and combines
-   whatever's new since the ticket last went DONE. This matters because
-   review naturally happens on GitHub, and not every reviewer wants to
-   context-switch to Jira just to leave a note. A PR comment from a bot/CI
-   author, or one that's our own output (`@bugbot run`, the `**aidev
-   decisions` log), is filtered out — only real human feedback counts.
-   Our own automated comments (rework acknowledgment, decisions log,
-   pickup notices) still only ever post to Jira, never to the PR — see
-   "Handing back a CI failure" above.
+   on GitHub** — the rework session is the *same* Claude Code session that
+   implemented the ticket originally (`--resume`, not a fresh session), so
+   it already has conversation memory of its own prior comments and doesn't
+   need to be told which of them to ignore. Its rework prompt tells it to
+   re-fetch and read what's changed from BOTH sources explicitly: Jira, and
+   the PR itself (`gh pr view`/`gh pr checks`/a merge-base check against
+   `master`, since a merge conflict or a new failing CI run can appear
+   independently of any comment). This matters because review naturally
+   happens on GitHub, and not every reviewer wants to context-switch to
+   Jira just to leave a note. Our own automated comments (rework
+   acknowledgment, decisions log, pickup notices) still only ever post to
+   Jira, never to the PR — see "Handing back a CI failure" above.
 3. The next `monitor.py` run detects a `DONE` ticket now sitting on
-   `In Progress` again, treats it as a rework request, and relaunches Claude
-   Code **in the same worktree and branch** with the combined feedback as
-   context.
+   `In Progress` again, treats it as a rework request, and relaunches the
+   same Claude Code session **in the same worktree and branch**, pointed at
+   re-reading the ticket and PR itself rather than being handed a
+   pre-filtered feedback string.
 4. Claude addresses the feedback, re-runs the review steps, commits, and
    pushes to the **same branch** — this updates the existing PR, no
-   duplicate is created.
+   duplicate is created. If `claude.auto_review: true`, `aidev-self-review`
+   is automatically re-applied on rework entry, same as a first pickup, so
+   self_review genuinely re-runs rather than being silently skipped;
+   `aidev-codex-review` stays manual-only on rework too, same as pickup.
 5. The ticket lands back on `In Review` + `aidev-done` once done, same as the
-   first pass. Repeat as many times as needed.
+   first pass. **`aidev-auto-merge` is a standing signature, not a
+   self-consuming tag like the review-depth tags above — it is never
+   removed by a rework.** If it was set before rework, it's still set after,
+   and the very next `monitor.py` sweep re-enters the full auto-merge
+   sequence from the top (base check, unresolved-feedback check, CI check,
+   then a fresh `@bugbot run`) — not from wherever it stopped before rework.
+   Repeat as many times as needed.
 6. When you're actually satisfied, move it to `Done` yourself.
 
 **Do not move it to `New`/todo instead** — `pickup_ticket()` skips any ticket
@@ -384,30 +431,42 @@ to master unattended, re-checked every cycle:
    tagging `aidev` itself on a dependency chain — each one starts its own
    sequence only once it's genuinely next in line, bottom-up, with no
    explicit cascade logic needed.
-2. **Merge conflict** → relaunches Claude (same mechanism as the review
+2. **Unresolved PR feedback check** — before touching Bugbot or approval at
+   all: has anything landed on the PR (a human comment/review, or a stale
+   Bugbot finding from an earlier commit) that nobody has actually acted on
+   yet? This exists because a GitHub-only comment with no Jira status change
+   is otherwise invisible to the pipeline — `process_done_ticket`'s rework
+   path only triggers off a Jira status flip, and self_review never reads PR
+   comments at all. Claude reads every current comment/review itself and
+   judges (not a keyword/author regex — the pipeline's own account posts
+   both the automated decisions-log comments AND relays your real ones, so
+   there's no author-based way to tell them apart) whether something real is
+   still unaddressed. Gated on the PR's head SHA, not a one-time flag, so a
+   later push re-triggers the check.
+3. **Merge conflict** → relaunches Claude (same mechanism as the review
    feedback loop) to resolve it, verify via typecheck, commit, push. A
-   semantically ambiguous conflict prints `AIDEV_NEEDS_INPUT` and the ticket
-   goes `STUCK` like any other — same reply-on-Jira-to-resume flow.
-3. **Bugbot** — `@bugbot run`, wait, relaunch Claude to fix real findings if
+   semantically ambiguous conflict writes status.json `needs_input` and the
+   ticket goes `STUCK` like any other — same reply-on-Jira-to-resume flow.
+4. **Bugbot** — `@bugbot run`, wait, relaunch Claude to fix real findings if
    any, loop until clean. This is the ONLY place Bugbot runs in the whole
    pipeline now — it moved here from every review pass specifically because
    a PR can sit in human review for a long time, and re-running Bugbot on
    the same already-reviewed commit at both self_review and merge time was
    pure waste.
-4. **Gates**: `ai-reviewed` label present, every required CI check green,
+5. **Gates**: `ai-reviewed` label present, every required CI check green,
    and a changelog entry OR the `no-changelog` label — self-heals the
    changelog check by diffing against master for source-file changes; if
    that's genuinely ambiguous (touches source, no entry, no label) it
    escalates rather than guessing whether it's customer-facing.
-5. **`/approve`** — the real convention here (verified against actual merged
+6. **`/approve`** — the real convention here (verified against actual merged
    PRs), NOT a fiction: commenting it triggers Cursor's own "Approval Agent"
    automation, which posts a genuine GitHub review — `APPROVED` when its own
-   bar is met, `COMMENTED` with a verdict otherwise. `AIDEV_NEEDS_INPUT`
-   doesn't apply here; this step polls and reads Cursor's own text the same
-   non-deterministic way SOUL.md already treats Bugbot — no regex-matching
-   its wording, just reading the verdict.
-6. **Three outcomes from Cursor's verdict**, not two:
-   - **`APPROVED`** → merge (see step 7).
+   bar is met, `COMMENTED` with a verdict otherwise. There's no
+   needs_input-style mechanical check here; this step polls and reads
+   Cursor's own text the same non-deterministic way SOUL.md already treats
+   Bugbot — no regex-matching its wording, just reading the verdict.
+7. **Three outcomes from Cursor's verdict**, not two:
+   - **`APPROVED`** → merge (see step 8).
    - **Fixable** (e.g. "Bugbot hasn't run on the latest commit") → the
      Bugbot loop above should already be addressing it; re-requests
      `/approve` once a newer Bugbot pass lands after the stale verdict.
@@ -419,10 +478,10 @@ to master unattended, re-checked every cycle:
      every cycle — the moment a real human `APPROVED` review lands on the
      PR (from anyone, not necessarily the person Cursor named), it resumes
      and merges on its own. This is a genuine wait, not a dead end.
-7. **Merge**: `gh pr merge --merge` — a real merge commit, verified against
+8. **Merge**: `gh pr merge --merge` — a real merge commit, verified against
    how every actual aidev PR to date has been merged here. Never
    `--squash`, never `--rebase`.
-8. **Success** → Jira ticket transitions to `Done`, with a comment linking
+9. **Success** → Jira ticket transitions to `Done`, with a comment linking
    the merge. **Any other failure** (the merge call itself fails
    unexpectedly, no PR URL recorded, etc.) removes the `aidev-auto-merge`
    label and comments why — re-tag once addressed to retry, same as tagging
