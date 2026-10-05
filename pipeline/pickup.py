@@ -133,9 +133,9 @@ Task:
   snapshot only (could not live-fetch: <reason>)" if you couldn't. Don't
   skip this line — a reviewer needs to know which one happened, not just
   that Jira context existed somewhere.
-- Do NOT run /simplify, /custom-simplify, or /custom-review yet — those run
-  in a follow-up pass after the PR exists (custom-review needs a real PR to
-  tag and comment on).
+- Do NOT run {config.review_skill()} yet —
+  it runs in a follow-up pass after the PR exists (its review needs a real PR
+  to tag and comment on).
 - Do not create `.aidev_prompt.txt` or any other pipeline-internal file in
   the repo — if you notice one from the orchestrator's tooling already
   tracked in git, that's a bug; `git rm --cached` it rather than leaving it

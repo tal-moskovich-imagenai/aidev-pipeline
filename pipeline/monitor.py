@@ -206,9 +206,10 @@ def finish_ticket(ticket):
     goes idle. What happens next depends on ticket['stage']:
     - 'implement' (the normal first pass): push, open the PR (once — every
       later stage just pushes to it), then relaunch Claude for 'self_review'
-      so /simplify, /custom-simplify, /custom-review run against a PR that
-      actually exists (custom-review tags it ai-reviewed and needs a real
-      PR number — running it before the PR existed silently no-op'd this).
+      so the configured review skill (claude.review_skill) runs against a PR
+      that actually exists (its review tags the PR ai-reviewed and
+      needs a real PR number — running it before the PR existed silently
+      no-op'd this).
     - 'self_review': push whatever Claude changed, then run Codex as a
       non-critical second opinion (see lib/codex_runner) and relaunch Claude
       only if Codex left real findings; otherwise hand off to human review
@@ -259,8 +260,7 @@ def finish_ticket(ticket):
 
     if stage == "implement":
         relaunch_for_stage(ticket, "self_review", pr_url,
-                            build_self_review_prompt, notice="running self-review (/simplify, "
-                            "/custom-simplify, /custom-review) now that the PR exists")
+                            build_self_review_prompt, notice=f"running {config.review_skill()} now that the PR exists")
         return
 
     if stage == "self_review":
@@ -315,7 +315,7 @@ def run_codex_stage(ticket, pr_url):
     except Exception:
         summary = key
 
-    ok, report_rel, detail = codex_runner.run_codex_review(ticket, key, summary, log=log)
+    ok, report_rel, detail = codex_runner.run_codex_review(ticket, key, summary, pr_url, log=log)
     if not ok:
         log(f"{key}: codex review skipped ({detail}) — handing off to human review")
         mark_review_done(ticket, pr_url)
@@ -346,20 +346,19 @@ def run_codex_stage(ticket, pr_url):
 
 
 def build_self_review_prompt(key, summary, pr_url):
-    steps = "\n".join(
-        f"{i+1}. Run the slash command: {s}"
-        for i, s in enumerate(config.load()["claude"]["post_steps"])
-    )
+    steps = f"1. Run the slash command: {config.review_skill()}"
     return f"""{soul_section()}You just finished implementing Jira ticket {key}: {summary}, and the
 orchestrator has pushed your branch and opened the PR: {pr_url}
 
 Now run your own review pass on the diff, in order:
 {steps}
 
-`/custom-review` needs a real PR to tag and comment on — it now has one
+`{config.review_skill()}` needs a real PR to review and comment on — it now has one
 ({pr_url}), which is why this runs as its own pass instead of before the PR
-existed. Commit and push again if you make any changes (same worktree/branch
-— do not open a new PR).
+existed. The PR already exists: skip its commit/open-PR steps and reuse it
+(same worktree/branch — never open a second PR). This is a headless run, so
+skip the demo-video step and say so; report its "Needs your call" list in the
+decisions log below.
 
 Before finishing, post your decisions log as its own PR comment: read
 `.claude-code/decisions-{key}.md` (if it doesn't exist, you made no notable
@@ -372,10 +371,7 @@ When done, say exactly: AIDEV_TASK_COMPLETE
 
 
 def build_codex_findings_prompt(key, summary, pr_url, report_rel, report_text):
-    steps = "\n".join(
-        f"{i+1}. Run the slash command: {s}"
-        for i, s in enumerate(config.load()["claude"]["post_steps"])
-    )
+    steps = f"1. Run the slash command: {config.review_skill()}"
     return f"""{soul_section()}You are addressing a second reviewer's findings on Jira ticket {key}: {summary}.
 
 This ticket already has an open PR: {pr_url}
@@ -391,8 +387,8 @@ report at `{report_rel}`:
 
 Use your own judgment, the same way you would for a human reviewer's comment:
 fix what's real, and say explicitly in the commit message why you're leaving
-anything you disagree with or consider out of scope. Codex cannot edit code
-itself — this report is advisory only.
+anything you disagree with or consider out of scope. Codex already ran the review skill and pushed its own
+fixes — this report lists what it fixed and what it left for a human.
 
 When done, run these steps in order:
 {steps}
@@ -517,10 +513,7 @@ def relaunch_claude(ticket, prompt):
 
 
 def build_rework_prompt(key, summary, feedback, pr_url):
-    steps = "\n".join(
-        f"{i+1}. Run the slash command: {s}"
-        for i, s in enumerate(config.load()["claude"]["post_steps"])
-    )
+    steps = f"1. Run the slash command: {config.review_skill()}"
     link = f"{config.load()['jira']['base_url']}/browse/{key}"
     live_fetch_note = jira_live_fetch_note(key, link)
     return f"""{soul_section()}You are addressing human review feedback on Jira ticket {key}: {summary}
@@ -794,16 +787,16 @@ mandatory/already required with no further automated path (e.g. it names a
 completed/pending human sign-off as the only remaining step, not just that
 someone was tagged in passing).
 
-- If the verdict tells you to run something (the custom-review skill, a
+- If the verdict tells you to run something ({config.review_skill()}, a
   fresh Bugbot pass, etc.) and you haven't already done that for the
-  current commit, do it now — the same custom-review/custom-simplify skills
-  from earlier stages are available to you here. Once you've taken that
+  current commit, do it now — the same {config.review_skill()} skill
+  from earlier stages is available to you here. Once you've taken that
   real action (code changed and pushed, a label added/removed, a skill run
   that genuinely wasn't run before on this commit), THEN comment `/approve`
   to get a fresh verdict — the action is what justifies asking again, not
   the other way round.
 - If the verdict names nothing actionable, or already reflects work you've
-  already done for this exact commit (you already ran custom-review, the
+  already done for this exact commit (you already ran {config.review_skill()}, the
   label's already set, etc.) — do NOT comment `/approve` again. Nothing
   changed since the last ask, so asking again would just get the same
   answer for no reason. Instead print exactly:
@@ -901,7 +894,7 @@ def _custom_review_covers_head(repo_path, pr_url, branch, head_sha):
     stays applied forever even after new commits land (e.g. a conflict
     resolution push in the middle of an auto-merge run). Caught live: Cursor's
     own Approval Agent correctly refused to approve a PR with a stale
-    `ai-reviewed` label and asked for /custom-review to be re-run — this
+    `ai-reviewed` label and asked for review to be re-run (the review skill) — this
     mirrors that same judgment in our own gate instead of trusting the label
     alone.
 
@@ -1143,15 +1136,15 @@ def process_auto_merge_ticket(ticket):
     if REQUIRED_LABEL not in label_names:
         escalate_auto_merge(
             ticket,
-            f"PR missing the '{REQUIRED_LABEL}' label — /custom-review may not have run. Not safe to auto-merge without it.",
+            f"PR missing the '{REQUIRED_LABEL}' label — the review skill may not have run. Not safe to auto-merge without it.",
         )
         return
 
     if not _custom_review_covers_head(repo_path, pr_url, branch, details.get("headRefOid", "")):
         log(f"{key}: auto-merge — '{REQUIRED_LABEL}' label is stale (commits landed since the "
-            f"last /custom-review pass, e.g. a conflict-resolution push) — re-running review")
+            f"last review pass, e.g. a conflict-resolution push) — re-running review")
         relaunch_for_stage(ticket, "auto_merge_recheck", pr_url, build_self_review_prompt,
-                            notice="auto-merge — re-running /custom-review, PR changed since the last pass")
+                            notice=f"auto-merge — re-running {config.review_skill()}, PR changed since the last pass")
         return
 
     # --- CI checks: red is Claude's to judge, yellow is just a wait ------

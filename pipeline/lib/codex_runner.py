@@ -1,22 +1,13 @@
-"""Runs `codex exec` as a non-critical second-opinion review pass.
+"""Runs `codex exec` as a non-critical second-opinion pass using the same
+review skill Claude runs (`claude.review_skill` in config.yaml, invoked in
+Codex as `$<name>`), against the PR that already exists for the ticket.
 
-Codex gets full workspace-write permissions (per the operator's choice — no
-sandbox restriction) but is instructed, in the prompt only, to write a report
-and never touch the tracked code. `run_codex_review` defends against a
-misbehaving run anyway: anything Codex changes beyond the report file itself
-is reverted with `git checkout` / untracked-file removal before returning,
-so a prompt-following failure can't leak into the ticket's diff.
-
-Codex already has custom-simplify/custom-review installed as native plugins
-(~/.codex/config.toml: `plugins."custom-simplify@imagen-skills"` and
-`plugins."custom-review@imagen-skills"`, kept in sync with the same
-`imagen-skills` marketplace repo Claude's plugin cache pulls from — verified
-identical content, not just same name). Codex's own `~/.codex/AGENTS.md`
-already tells it to use available skills and fall back to reading a skill's
-instruction file directly when a slash-command runner isn't available, so
-the prompt below references both skills by name rather than resolving and
-inlining file paths itself — Codex's own install is the source of truth, not
-a path this pipeline guesses at.
+Codex has the skill installed natively (~/.codex/config.toml:
+`plugins."<name>@imagen-skills"`, same marketplace repo as Claude's plugin
+cache). Because the skill fixes, commits and pushes on its own, Codex is no
+longer report-only; it still writes a short report so the caller can tell
+whether anything was left for a human, and `_revert_stray_changes` still
+discards uncommitted leftovers beyond that report.
 
 Every failure mode here (timeout, non-zero exit, codex not installed, out of
 credits, malformed output) is non-fatal by design — the caller always gets a
@@ -27,71 +18,49 @@ import os
 import subprocess
 
 from . import config
+from .soul import soul_section
 
 
-def build_codex_review_prompt(key, summary, report_path):
-    return f"""You are a second-opinion code reviewer on Jira ticket {key}: {summary},
+def build_codex_review_prompt(key, summary, pr_url, report_path):
+    skill = config.review_skill().lstrip("/")
+    return f"""{soul_section()}You are a second-opinion reviewer on Jira ticket {key}: {summary},
 running as `codex exec` in this git worktree/branch alongside a primary
 implementer (Claude Code) and an automated bot (Cursor Bugbot).
 
-You have full read/write permissions in this sandbox, but your ONLY job here
-is to WRITE A REPORT. Do not edit, create, delete, or move any tracked file
-in this repository. Do not run `git commit`, `git add`, or anything that
-changes the working tree's tracked content. The one file you may write is
-the report path given below.
+The implementation is already committed and a PR is already open: {pr_url}
+Do NOT create a new branch or a second PR — the skill's commit/open-PR steps
+must reuse this worktree, branch and PR. Claude has already run the same
+skill once on this PR, so focus on what it may have missed. If you need
+ticket context beyond the above, read the PR description and the repo's own
+conventions (CLAUDE.md, AGENTS.md, .agents/rules/*).
 
-You have the `custom-simplify` and `custom-review` skills installed — the
-same ones Claude Code runs as `/custom-simplify` and `/custom-review` on
-this same diff. In this session, invoke them with Codex's own skill syntax:
+Run the `{skill}` skill with Codex's own syntax:
 
-$custom-simplify
-$custom-review
+${skill}
 
-Actually follow their documented procedures step by step when they run, not
-a paraphrase of them. If invoking them this way doesn't work in this
-session for any reason, read each skill's instruction file yourself instead
-and follow it manually — do not skip either pass just because the
-invocation syntax failed.
+Follow its documented procedure step by step. If invoking it this way doesn't
+work in this session, read its instruction file yourself and follow it
+manually. This is a headless run: skip any demo-video step and say so.
 
-Then, in order:
-
-1. Run `custom-simplify`'s procedure against this diff: classify every
-   comment added in the diff per its Step 1 table, and check for the
-   readability issues its later steps cover (extract-worthy sections,
-   KISS/DRY/module-separation problems) in the code that changed. You will
-   not edit anything — instead, for each comment/section that the skill's
-   own criteria say should be converted, deleted, or extracted, record it
-   as a finding: what the skill's rule says, and what change it implies.
-2. Run `custom-review`'s procedure: read the repo's own conventions
-   (CLAUDE.md, AGENTS.md, .agents/rules/*) the skill tells you to load, and
-   check the diff against them the way that skill directs, plus general
-   correctness concerns a careful reviewer would flag.
-
-Determine the diff to review yourself (likely `git diff <base>...HEAD` where
-base is the branch's true parent — check `git log` and any stacked-PR notes
-in the worktree). Do not fetch anything from GitHub or run any `gh` command —
-this is a local-diff-only pass; you have no PR to comment on or tag.
-
-Write your findings to exactly this path, as markdown, and nothing else:
+When it finishes, write a short markdown report to exactly this path, and
+nothing else beyond what the skill itself does:
 {report_path}
 
-Use this structure, with the two skills as separate sections so Claude can
-tell which procedure surfaced which finding:
+Use this structure:
 # Codex Review — {key}
 ## Verdict: CLEAN | NEEDS_ATTENTION
-## Simplify findings (from custom-simplify)
-(one item per issue: `file:line`, what the skill's rule says, suggested
- change — or "No findings." if genuinely clean)
-## Review findings (from custom-review)
-(one item per issue: `file:line`, severity, what's wrong, suggested fix —
- or "No findings." if genuinely clean)
+## Fixed automatically
+(what the skill fixed and pushed, with commit SHAs — or "Nothing.")
+## Needs your call
+(the skill's unresolved items, one per line with `file:line` and the reason —
+ or "Nothing.")
 
-Verdict is CLEAN only if BOTH sections are empty. When you are done writing
-the report, stop. Do not attempt anything else.
+Verdict is CLEAN only if "Needs your call" is empty and CI is green or
+unaffected. When the report is written, stop.
 """
 
 
-def run_codex_review(ticket, key, summary, log=lambda *a, **k: None):
+def run_codex_review(ticket, key, summary, pr_url, log=lambda *a, **k: None):
     """Runs codex exec in the ticket's worktree. Returns (ok, report_path,
     detail). ok=False means Codex is unavailable/failed for any reason —
     callers must treat this as skip-and-continue, never as a pipeline
@@ -113,7 +82,7 @@ def run_codex_review(ticket, key, summary, log=lambda *a, **k: None):
     if os.path.exists(report_abs):
         os.remove(report_abs)  # stale report from a previous round shouldn't look like a fresh one
 
-    prompt = build_codex_review_prompt(key, summary, report_rel)
+    prompt = build_codex_review_prompt(key, summary, pr_url, report_rel)
 
     try:
         result = subprocess.run(

@@ -8,7 +8,7 @@ description: Read before creating or tagging a Jira ticket for the aidev pipelin
 The **aidev pipeline** (code in this repo under `pipeline/`, deployed at
 `~/jira-claude-pipeline` on this machine) polls Jira for tickets labeled
 `aidev` and runs them end-to-end through Claude Code: git worktree →
-implementation → `/simplify` → `/custom-simplify` → `/custom-review` → commit
+implementation → the configured review skill (`claude.review_skill`: simplify → review → fixes → CI) → commit
 → PR → Jira comment/status update. No human types anything unless the ticket
 is genuinely ambiguous.
 
