@@ -39,7 +39,7 @@ def build_task_prompt(issue, stack_base_key=None):
     summary = issue["fields"]["summary"]
     cfg = config.load()
     base_url = cfg["jira"]["base_url"]
-    post_steps = ", ".join(cfg["claude"]["post_steps"])
+    review_skill = config.review_skill()
     link = f"{base_url}/browse/{key}"
     live_fetch_note = jira_live_fetch_note(key, link)
     stack_note = ""
@@ -149,8 +149,8 @@ Task:
   snapshot only (could not live-fetch: <reason>)" if you couldn't. Don't
   skip this line — a reviewer needs to know which one happened, not just
   that Jira context existed somewhere.
-- Do NOT run any of these yet: {post_steps} — those run in a
-  follow-up pass after the PR exists (custom-review needs a real PR to
+- Do NOT run {review_skill} yet — it runs in a
+  follow-up pass after the PR exists (its review needs a real PR to
   tag and comment on).
 - Do not create `.aidev_prompt.txt` or any other pipeline-internal file in
   the repo — if you notice one from the orchestrator's tooling already

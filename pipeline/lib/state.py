@@ -217,14 +217,14 @@ def _migrate(conn):
 
 
 def set_last_reviewed_sha(ticket_key, sha):
-    """Records the exact commit SHA that a genuine /custom-review pass just
+    """Records the exact commit SHA that a genuine review pass just
     ran against (read directly from git, not parsed out of Claude's own
     free-text PR comment — that parsing was a real, live bug: Claude wrote
     'current HEAD 6d162f4' instead of 'commit 6d162f4' once and the regex
     silently stopped matching forever, causing a 34-cycle self-review loop
     on RND-14813/PR #5759 until max_running_hours finally killed it).
     set_last_reviewed_sha is called right after a stage that actually runs
-    /custom-review (self_review, auto_merge_recheck) pushes its changes —
+    the review skill (self_review, auto_merge_recheck) pushes its changes —
     the git HEAD at that moment IS the reviewed commit, no text-parsing
     needed."""
     with db() as conn:

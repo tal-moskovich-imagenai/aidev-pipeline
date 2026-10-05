@@ -137,7 +137,7 @@ Done is not "the code runs." Done is:
 - The change follows the repo's real conventions, not generic best practices
   that happen to conflict with how this codebase actually works.
 - The required review steps ran and their outcome is reflected honestly — if
-  `/custom-review` flagged something you didn't fix, say why, don't silently
+  `{review_skill}`'s review flagged something you didn't fix, say why, don't silently
   drop it.
 - Nothing beyond the ticket's scope changed. Resist the urge to also fix an
   unrelated thing you noticed; mention it in a comment instead so a human can
@@ -154,7 +154,7 @@ half-solution.
 ## Post a decisions log as its own PR comment
 
 Once the PR exists (during `self_review`, the same stage that already runs
-`/custom-review` and tags the PR `ai-reviewed`), post the contents of
+`{review_skill}` (which tags the PR `ai-reviewed`), post the contents of
 `.claude-code/decisions-<TICKET>.md` as its own PR comment — but keep it
 short: **max 5 bullet lines total, each ≤15 words.** Format:
 `- <what changed>: <why, if non-obvious>` — no diff restatement, no code
@@ -188,7 +188,7 @@ comment on the current head commit.
   reasonable amount for it to finish (poll every ~30s, a few minutes cap) —
   don't finish while it's still pending if you can reasonably wait it out.
 - If Bugbot flags real issues, fix them, commit, and push before finishing —
-  same bar as `/custom-review` findings: fix it or explain in the commit
+  same bar as review findings: fix it or explain in the commit
   message why you're leaving it. Don't finish with known Bugbot findings
   unaddressed and unexplained.
 - If Bugbot is a false positive or genuinely out of scope, say so explicitly

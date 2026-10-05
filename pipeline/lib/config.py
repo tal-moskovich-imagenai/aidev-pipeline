@@ -14,6 +14,10 @@ def load():
     return _cache
 
 
+def review_skill():
+    return load()["claude"]["review_skill"]
+
+
 def repo_for(labels):
     cfg = load()
     for l in labels:

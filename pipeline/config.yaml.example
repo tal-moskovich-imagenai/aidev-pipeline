@@ -18,9 +18,7 @@ worktree_root: "/Users/talmoskovich/jira-claude-pipeline/worktrees"
 
 claude:
   dangerously_skip_permissions: true
-  post_steps:                            # slash commands run in-session after the main task, in order
-    - "/custom-simplify"
-    - "/custom-review"
+  review_skill: "/land-pr"               # slash command run in-session after the PR exists (Codex gets the same name as $skill)
   idle_seconds: 20                       # pane must be unchanged this long to be considered "idle"
   idle_poll_interval: 8
   max_wait_seconds: 5400                 # hard cap per postprocess stage (90 min)
@@ -77,12 +75,12 @@ claude:
 codex:
   enabled: true
   timeout_seconds: 1800                  # 30 min hard cap on the codex exec subprocess
-  sandbox: "workspace-write"             # full permissions; the prompt tells it not to edit code
+  sandbox: "workspace-write"             # full permissions; runs the review skill, which fixes and pushes
   min_diff_lines: 30                     # below this many total changed lines, skip Codex
-                                          # entirely and rely on the /custom-review pass already
+                                          # entirely and rely on the review pass already
                                           # run during self_review — 0 disables this gate
   report_dir: ".claude-code"             # relative to the worktree; matches repo's scratch-doc convention
-                                          # custom-simplify/custom-review are installed natively in Codex
+                                          # the claude.review_skill plugin is installed natively in Codex
                                           # (~/.codex/config.toml plugins."*@imagen-skills", same
                                           # imagen-skills marketplace repo as Claude's plugin cache) — the
                                           # prompt invokes them with Codex's own $skill-name syntax, no
