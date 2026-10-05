@@ -19,13 +19,28 @@ worktree_root: "/Users/talmoskovich/jira-claude-pipeline/worktrees"
 claude:
   dangerously_skip_permissions: true
   post_steps:                            # slash commands run in-session after the main task, in order
-    - "/simplify"
     - "/custom-simplify"
     - "/custom-review"
   idle_seconds: 20                       # pane must be unchanged this long to be considered "idle"
   idle_poll_interval: 8
   max_wait_seconds: 5400                 # hard cap per postprocess stage (90 min)
   max_running_hours: 6                   # ticket marked FAILED if still RUNNING/STUCK past this
+  max_crash_auto_retries: 1              # a crashed process (tmux alive, claude dead; or
+                                          # status.json stale 10+ min) auto-relaunches this many
+                                          # times (same session, same stage) before giving up and
+                                          # marking FAILED for a human — every real crash traced so
+                                          # far had a clean, safely-resumable worktree
+  context_handoff_threshold: 0.8         # fraction of the model's context window (see
+                                          # models.<stage> below for which model — this assumes
+                                          # the 1M-token Sonnet/Opus window) at which a RUNNING
+                                          # session is proactively retired: asked to write a
+                                          # handoff doc, killed, and replaced with a fresh session
+                                          # that reads the handoff instead of --resuming a
+                                          # conversation close to its limit. This is a distinct,
+                                          # earlier trigger than a crash — the session is still
+                                          # healthy when this fires, unlike max_crash_auto_retries
+                                          # which only reacts after something has already gone
+                                          # wrong. Set to 0 or null to disable.
   max_concurrent: 3                      # cap on tickets occupying a Claude Code slot at once
                                           # (RUNNING/STUCK/POSTPROCESS/PR_OPENED); DONE tickets have
                                           # already handed off to human review and don't count —
@@ -36,11 +51,36 @@ claude:
   max_postprocess_attempts: 5            # transient PR-step failures (e.g. slow git commit/push
                                           # in a big repo) retry this many times before FAILED;
                                           # tmux/Claude session stays alive across retries
+  auto_review: true                      # apply aidev-self-review at pickup time automatically
+                                          # (mirrors qelos-io/aidev's AUTO_REVIEW=true) — set false
+                                          # to require manual tagging instead.
+  models:                                # per-stage --model override. Every stage below
+                                          # is pinned EXPLICITLY, not left null/"account
+                                          # default" — the whole point of this block is to
+                                          # be immune to a silent account-default change
+                                          # (2.1.280 changed the Pro/Team Standard default
+                                          # from Sonnet to Opus). Haiku only for the
+                                          # approval-verdict stage (simple 3-way
+                                          # classification against an explicit rule, not
+                                          # open-ended judgment — see SKILL.md).
+    implement: "sonnet"
+    rework: "sonnet"
+    self_review: "sonnet"
+    codex_check: "sonnet"
+    auto_merge_resolving_conflict: "sonnet"
+    auto_merge_fixing_bugbot: "sonnet"
+    auto_merge_recheck: "sonnet"
+    auto_merge_fixing_ci: "sonnet"
+    auto_merge_addressing_approval_feedback: "haiku"
+    auto_merge_addressing_pr_feedback: "sonnet"
 
 codex:
   enabled: true
   timeout_seconds: 1800                  # 30 min hard cap on the codex exec subprocess
   sandbox: "workspace-write"             # full permissions; the prompt tells it not to edit code
+  min_diff_lines: 30                     # below this many total changed lines, skip Codex
+                                          # entirely and rely on the /custom-review pass already
+                                          # run during self_review — 0 disables this gate
   report_dir: ".claude-code"             # relative to the worktree; matches repo's scratch-doc convention
                                           # custom-simplify/custom-review are installed natively in Codex
                                           # (~/.codex/config.toml plugins."*@imagen-skills", same

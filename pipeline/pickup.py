@@ -37,7 +37,9 @@ def mark_failed(key, reason):
 def build_task_prompt(issue, stack_base_key=None):
     key = issue["key"]
     summary = issue["fields"]["summary"]
-    base_url = config.load()["jira"]["base_url"]
+    cfg = config.load()
+    base_url = cfg["jira"]["base_url"]
+    post_steps = ", ".join(cfg["claude"]["post_steps"])
     link = f"{base_url}/browse/{key}"
     live_fetch_note = jira_live_fetch_note(key, link)
     stack_note = ""
@@ -53,20 +55,29 @@ is expected and correct, not a mistake. Do not try to remove or revert
 {stack_base_key}'s branch; that's normal for a stacked PR and a human will
 rebase once the base merges.
 
-Read {stack_base_key}'s actual diff and PR/ticket description in full before
-implementing — not just its title. `gh pr view <its-branch-or-number>` or
-`git log`/`git diff` against its branch. Knowing you're stacked on it isn't
-the same as knowing what it changed; you need that to build correctly on top
-of it.
+You do **not** need to read {stack_base_key}'s full diff or PR description up
+front. Check its section in the shared epic doc first (see below) — pull its
+actual diff or PR (`gh pr view <branch>` / `git diff`) only if that section's
+bullets don't answer a specific question you have about what it changed.
 
 Also check whether anything is already stacked on THIS ticket — another open
 ticket/PR that lists {key} as its own blocker. If so, be aware your changes
 here can affect that work too (mention it in your PR description if it's
 relevant), since it's relying on whatever you land.
 """
+    cross_repo_note = """
+## Check your blockers
+
+Look at this ticket's Jira blockers (either direction). If a blocker is in
+a different repo, it's a soft blocker that may be running in parallel with
+you right now — check its status and branch yourself and make sure you're
+aligned with it (shared interface, API shape, whatever the two sides hand
+off) before assuming anything about it.
+"""
     return f"""{soul_section()}You are working on Jira ticket {key}: {summary}
 Link: {link}
 {stack_note}
+{cross_repo_note}
 {live_fetch_note}
 ## Shared context — read before doing anything else, and lives in the repo, not the worktree
 
@@ -93,19 +104,24 @@ path is under some other worktree that no longer exists, treat that as data
 loss worth flagging, not something to silently re-derive.
 
 If any such references exist:
-1. Read every one of them FULLY before starting implementation. They often
-   contain decisions, constraints, or context essential to doing this right
-   — do not skip past them or skim.
+1. Read every one of them FULLY before starting implementation (this applies
+   to ticket-specific docs/Notion/Figma/Slack links — the narrower
+   on-demand exception above is only about an *ancestor* stacked ticket's
+   own diff/PR, not these). They often contain decisions, constraints, or
+   context essential to doing this right — do not skip past them or skim.
 2. Any local `.md` file referenced this way is almost certainly shared by
    OTHER tickets too (a whole epic's worth of context can live in one doc).
    Treat it as a living document, not this ticket's private scratch space.
 3. When you learn something new, make a decision, or finish a step that
    future readers (you on a later ticket, a human, or another agent) would
-   need to know — APPEND it to the relevant file **in the repo root's
-   `.claude-code/`**, in a clearly dated/labeled section. Never overwrite or
-   delete existing content, never rewrite history, only add. Follow the
-   file's existing structure/style if it has one (e.g. a "Decisions" table, a
-   dated "## Decisions taken while implementing" section).
+   need to know — write it to the relevant file **in the repo root's
+   `.claude-code/`**, as your own section: `## {key}` followed by up to 10
+   short bullets (what changed, why, anything the next ticket needs to
+   know). If this ticket already has a `## {key}` section in that doc
+   (e.g. from an earlier rework pass), **overwrite that whole section in
+   place** — don't append a second one; this is what keeps the doc bounded
+   across a long epic, not a per-bullet cap by itself. Other tickets'
+   sections are still never touched or rewritten by you, only your own.
 4. If no such references exist in this ticket, skip this section entirely —
    don't invent one.
 
@@ -133,8 +149,8 @@ Task:
   snapshot only (could not live-fetch: <reason>)" if you couldn't. Don't
   skip this line — a reviewer needs to know which one happened, not just
   that Jira context existed somewhere.
-- Do NOT run /simplify, /custom-simplify, or /custom-review yet — those run
-  in a follow-up pass after the PR exists (custom-review needs a real PR to
+- Do NOT run any of these yet: {post_steps} — those run in a
+  follow-up pass after the PR exists (custom-review needs a real PR to
   tag and comment on).
 - Do not create `.aidev_prompt.txt` or any other pipeline-internal file in
   the repo — if you notice one from the orchestrator's tooling already
@@ -142,24 +158,33 @@ Task:
   in your commit.
 
 If at any point you hit a decision that genuinely needs a human (per the
-"How much to decide vs. ask" and "`AIDEV_NEEDS_INPUT` fires at most once per
+"How much to decide vs. ask" and "`needs_input` fires at most once per
 ticket" sections above), do NOT stop and ask immediately — research it, form
 a suggested answer, keep working with that as your provisional assumption,
-and log it to `.claude-code/decisions-<TICKET>.md`. Only print
-`AIDEV_NEEDS_INPUT` once, at the very end, batching every open question
+and log it to `.claude-code/decisions-<TICKET>.md`. Only write status.json's
+`needs_input` update once, at the very end, batching every open question
 together, as described above.
 
 When you are fully done — committed, pushed, and the PR is open with a real
-title and description — say exactly: AIDEV_TASK_COMPLETE
+title and description — write status.json's state to "complete".
 """
 
 
 def pickup_ticket(issue):
     cfg = config.load()
     key = issue["key"]
-    if state.get(key):
+    existing = state.get(key)
+    if existing and existing.get("state") != "ARCHIVED":
         log(f"{key}: already tracked, skipping")
         return False
+    # An ARCHIVED row means a prior attempt is fully wound down (worktree
+    # removed, branch deleted) and the ticket has since been reset to New —
+    # e.g. a wrong-repo pickup that was cleaned up and corrected via a repo:
+    # label fix. Insert below correctly overwrites the old row for the same
+    # key rather than skipping. Caught live: RND-14736 was archived and
+    # reset to New specifically to be re-picked up against the corrected
+    # repo, but sat untouched forever because this check treated ANY row —
+    # including an already-archived one — as "still tracked."
 
     labels = issue["fields"].get("labels", [])
     repo_path = config.repo_for(labels)
@@ -176,7 +201,38 @@ def pickup_ticket(issue):
     # Review", not merged). If stacking is enabled, proceed by branching off
     # the blocker's own branch instead of waiting for it to merge — mirrors
     # a human building PR N+1 on top of PR N before N lands.
-    soft_blockers = [(k, s) for k, s, hard in blockers if not hard]
+    #
+    # This whole "stack instead of wait" rationale only applies when the
+    # blocker's code lives in the SAME repo — there is no branch to stack
+    # on, and no real code dependency to wait for, when the blocker is in a
+    # different repo (a Jira "blocks" link has no notion of repo). Such a
+    # cross-repo soft blocker is dropped from consideration entirely here —
+    # not skipped, not stacked on, just not blocking — rather than treated
+    # as "in review, can't determine branch, skip." Caught live: RND-14828
+    # (submitter-app-electron) was soft-blocked by RND-14840 (app-web-server,
+    # itself In Review) and sat skipped every cycle even though nothing
+    # about RND-14840 being in review has any bearing on RND-14828's own
+    # ability to proceed against master right now.
+    all_soft_blockers = [(k, s) for k, s, hard in blockers if not hard]
+    soft_blockers = []
+    for k, s in all_soft_blockers:
+        blocker_ticket = state.get(k)
+        if blocker_ticket:
+            blocker_repo = blocker_ticket.get("repo_path")
+        else:
+            try:
+                blocker_issue = jira_client.get_issue(k, fields=["labels"])
+                blocker_repo = config.repo_for(blocker_issue["fields"].get("labels", []))
+            except Exception as e:
+                log(f"{key}: could not resolve blocker {k}'s repo, treating as same-repo "
+                    f"(conservative — will still try to stack): {e}")
+                blocker_repo = repo_path
+        if blocker_repo != repo_path:
+            log(f"{key}: blocker {k} ({s}) lives in a different repo ({blocker_repo} vs "
+                f"{repo_path}) — no code dependency here, not blocking")
+            continue
+        soft_blockers.append((k, s))
+
     stack_base_branch = None
     stack_base_key = None
     if soft_blockers:
@@ -192,12 +248,28 @@ def pickup_ticket(issue):
         # Prefer the pipeline's own state DB (exact, no ambiguity). Fall
         # back to searching GitHub for an open PR referencing the blocker's
         # ticket key — covers blockers built manually, outside this pipeline.
+        # Must also confirm the blocker lives in the SAME repo as this
+        # ticket — a Jira "blocks" link has no notion of repo, so two
+        # tickets can be linked while their actual code lives in entirely
+        # separate repos (e.g. a BE ticket blocking an unrelated FE one).
+        # Stacking a branch in repo A on top of a branch that only exists in
+        # repo B's git history is meaningless and fails at worktree-creation
+        # time. Caught live: RND-14828 (submitter-app-electron) was blocked
+        # by RND-14840 (app-web-server) — pickup tried `git worktree add`
+        # against `origin/aidev/RND-14840`, a branch that only exists in the
+        # other repo's remote, failed every cycle for 35+ minutes, and
+        # crashed out of the whole pickup batch before ever reaching the
+        # other 2 waiting tickets that cycle.
         blocker_ticket = state.get(stack_base_key)
-        if blocker_ticket and blocker_ticket.get("branch"):
+        if blocker_ticket and blocker_ticket.get("branch") and blocker_ticket.get("repo_path") == repo_path:
             stack_base_branch = blocker_ticket["branch"]
             log(f"{key}: stacking on {stack_base_key}'s branch {stack_base_branch} "
                 f"(tracked locally, still In Review, not merged)")
         else:
+            if blocker_ticket and blocker_ticket.get("branch") and blocker_ticket.get("repo_path") != repo_path:
+                log(f"{key}: blocker {stack_base_key} is tracked locally but lives in a "
+                    f"different repo ({blocker_ticket.get('repo_path')} vs {repo_path}) — "
+                    f"cannot stack across repos, falling back to gh search")
             stack_base_branch = github.find_open_pr_branch(repo_path, stack_base_key)
             if stack_base_branch:
                 log(f"{key}: stacking on {stack_base_key}'s branch {stack_base_branch} "
@@ -236,15 +308,25 @@ def pickup_ticket(issue):
         f.write(prompt)
 
     skip_perms = "--dangerously-skip-permissions" if cfg["claude"]["dangerously_skip_permissions"] else ""
-    claude_cmd = (
-        f"cd {worktree_path} && "
-        f"DISABLE_AUTOUPDATER=1 claude --session-id {session_id} {skip_perms} "
-        f"\"$(cat .claude-code/.aidev_prompt.txt)\""
-    )
-    procs.tmux_send(tmux_name, claude_cmd)
+    model = (cfg["claude"].get("models") or {}).get("implement")
+    model_flag = f"--model {model} " if model else ""
+    def _build_claude_cmd():
+        return (
+            f"cd {worktree_path} && "
+            f"DISABLE_AUTOUPDATER=1 claude --session-id {session_id} {model_flag}{skip_perms} "
+            f"\"$(cat .claude-code/.aidev_prompt.txt)\""
+        )
+    if not procs.launch_claude_verified(tmux_name, worktree_path, _build_claude_cmd):
+        raise RuntimeError(
+            f"{key}: claude never verifiably started in {worktree_path} after retrying — "
+            f"likely the shell-startup race (see procs.py); check the pane manually"
+        )
 
+    if existing and existing.get("state") == "ARCHIVED":
+        state.delete_archived(key)
     state.insert(key, repo_path, worktree_path, branch, session_id, tmux_name, state="RUNNING",
                  stacked_on=stack_base_key, stacked_on_branch=stack_base_branch)
+    state.record_stage_transition(key, session_id, "implement", model)
 
     resume_cmd = f"cd {worktree_path} && claude --resume {session_id}"
     stack_note = f"\nStacked on: {stack_base_key} (still In Review — this branch will need rebasing once it merges)\n" if stack_base_key else ""
@@ -266,6 +348,11 @@ def pickup_ticket(issue):
         jira_client.set_state_label(key, "aidev-picked")
     except Exception as e:
         log(f"{key}: label warning: {e}")
+    if cfg["claude"].get("auto_review", True):
+        try:
+            jira_client.add_label(key, "aidev-self-review")
+        except Exception as e:
+            log(f"{key}: could not apply aidev-self-review label: {e}")
     board_id = cfg["jira"].get("board_id")
     if board_id:
         try:

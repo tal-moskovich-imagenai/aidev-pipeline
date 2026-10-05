@@ -21,6 +21,15 @@ CREATE TABLE IF NOT EXISTS tickets (
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS stage_transitions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_key   TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    stage        TEXT NOT NULL,
+    model        TEXT,
+    started_at   TEXT DEFAULT (datetime('now'))
+);
 """
 
 # Valid states: NEW -> RUNNING -> (STUCK <-> RUNNING)* -> POSTPROCESS -> PR_OPENED -> DONE  (or FAILED)
@@ -31,7 +40,7 @@ def db():
     cfg = config.load()
     conn = sqlite3.connect(cfg["state_db"])
     conn.row_factory = sqlite3.Row
-    conn.execute(SCHEMA)
+    conn.executescript(SCHEMA)
     _migrate(conn)
     try:
         yield conn
@@ -87,6 +96,20 @@ def set_archived(ticket_key):
     with db() as conn:
         conn.execute(
             "UPDATE tickets SET state = 'ARCHIVED', updated_at = datetime('now') WHERE ticket_key = ?",
+            (ticket_key,),
+        )
+
+
+def delete_archived(ticket_key):
+    """Removes an ARCHIVED row entirely so the ticket can be picked up
+    fresh (e.g. a wrong-repo pickup that was cleaned up and corrected).
+    `ticket_key` is the table's PRIMARY KEY, so a second insert() for the
+    same key without this first would crash on a UNIQUE constraint
+    violation — deliberately scoped to ARCHIVED only, never call this on a
+    row that might still be RUNNING/DONE/etc."""
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM tickets WHERE ticket_key = ? AND state = 'ARCHIVED'",
             (ticket_key,),
         )
 
@@ -150,6 +173,19 @@ def set_last_comment_id(ticket_key, comment_id):
         )
 
 
+def set_session_id(ticket_key, session_id):
+    """Persists a freshly-minted session_id onto the ticket row — used when
+    a context-exhaustion handoff starts a genuinely new session (fresh
+    --session-id, not --resume) rather than continuing the old one, so every
+    later relaunch (crash-retry, rework, review stages) --resumes the new
+    session and not the one that was deliberately retired."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET session_id = ?, updated_at = datetime('now') WHERE ticket_key = ?",
+            (session_id, ticket_key),
+        )
+
+
 def _migrate(conn):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(tickets)").fetchall()}
     if "stuck_question" not in cols:
@@ -172,6 +208,44 @@ def _migrate(conn):
         conn.execute("ALTER TABLE tickets ADD COLUMN last_bugbot_trigger_sha TEXT")
     if "last_bugbot_trigger_at" not in cols:
         conn.execute("ALTER TABLE tickets ADD COLUMN last_bugbot_trigger_at TEXT")
+    if "last_reviewed_sha" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN last_reviewed_sha TEXT")
+    if "last_feedback_checked_sha" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN last_feedback_checked_sha TEXT")
+    if "crash_retry_count" not in cols:
+        conn.execute("ALTER TABLE tickets ADD COLUMN crash_retry_count INTEGER NOT NULL DEFAULT 0")
+
+
+def set_last_reviewed_sha(ticket_key, sha):
+    """Records the exact commit SHA that a genuine /custom-review pass just
+    ran against (read directly from git, not parsed out of Claude's own
+    free-text PR comment — that parsing was a real, live bug: Claude wrote
+    'current HEAD 6d162f4' instead of 'commit 6d162f4' once and the regex
+    silently stopped matching forever, causing a 34-cycle self-review loop
+    on RND-14813/PR #5759 until max_running_hours finally killed it).
+    set_last_reviewed_sha is called right after a stage that actually runs
+    /custom-review (self_review, auto_merge_recheck) pushes its changes —
+    the git HEAD at that moment IS the reviewed commit, no text-parsing
+    needed."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET last_reviewed_sha = ? WHERE ticket_key = ?",
+            (sha, ticket_key),
+        )
+
+
+def set_last_feedback_checked_sha(ticket_key, sha):
+    """Records the commit SHA at which the auto-merge sequence last had
+    Claude read every current PR comment/review (human feedback, or a
+    Bugbot review from before this pass) and judge whether anything real
+    is still unresolved — see check_new_pr_feedback in monitor.py. Keyed
+    to a SHA, not a boolean, so a later push (new commits) re-triggers the
+    check rather than trusting a stale 'already checked' flag forever."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET last_feedback_checked_sha = ? WHERE ticket_key = ?",
+            (sha, ticket_key),
+        )
 
 
 def set_last_bugbot_trigger_sha(ticket_key, sha):
@@ -200,6 +274,19 @@ def set_stage(ticket_key, stage):
         )
 
 
+def record_stage_transition(ticket_key, session_id, stage, model=None):
+    """Append-only log of every stage transition — session_id + stage +
+    model + timestamp — so a later ccusage session record can be
+    cross-referenced back to a specific pipeline stage (Step J). Never
+    updates/deletes existing rows; a ticket's full stage history is just
+    every row with its ticket_key, in insertion order."""
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO stage_transitions (ticket_key, session_id, stage, model) VALUES (?, ?, ?, ?)",
+            (ticket_key, session_id, stage, model),
+        )
+
+
 def record_postprocess_failure(ticket_key, error):
     """Transient PR-step failure: bump the retry counter and go back to
     POSTPROCESS (not FAILED) so the next monitor.py run retries — the work is
@@ -216,6 +303,32 @@ def clear_postprocess_failure(ticket_key):
     with db() as conn:
         conn.execute(
             "UPDATE tickets SET postprocess_attempts = 0, last_postprocess_error = NULL WHERE ticket_key = ?",
+            (ticket_key,),
+        )
+
+
+def bump_crash_retry_count(ticket_key):
+    """Returns the count AFTER incrementing — callers compare this against
+    their own retry limit before deciding to auto-relaunch vs. give up."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET crash_retry_count = crash_retry_count + 1 WHERE ticket_key = ?",
+            (ticket_key,),
+        )
+        row = conn.execute(
+            "SELECT crash_retry_count FROM tickets WHERE ticket_key = ?", (ticket_key,)
+        ).fetchone()
+        return row["crash_retry_count"] if row else 0
+
+
+def clear_crash_retry_count(ticket_key):
+    """Called once a ticket makes real forward progress (a fresh status.json
+    update, or reaching POSTPROCESS/DONE) — resets the counter so a later,
+    unrelated crash still gets its own full retry budget rather than
+    inheriting an old ticket's exhausted count."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE tickets SET crash_retry_count = 0 WHERE ticket_key = ?",
             (ticket_key,),
         )
 

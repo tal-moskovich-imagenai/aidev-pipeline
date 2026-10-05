@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-aidev monitor — checks tickets in RUNNING state; when the tmux pane shows the
-AIDEV_TASK_COMPLETE marker (or goes idle), moves them to POSTPROCESS: pushes
-the branch, opens a PR via gh, and posts a summary comment back to Jira.
+aidev monitor — checks tickets in RUNNING state; when `.claude-code/status.json`
+reports state "complete", moves them to POSTPROCESS: pushes the branch, opens
+a PR via gh, and posts a summary comment back to Jira.
 
-Also checks tickets in STUCK state; when Claude printed AIDEV_NEEDS_INPUT it
+Also checks tickets in STUCK state; when status.json reports "needs_input" it
 posts the question as a Jira comment and waits. Once a human replies on the
 ticket (a comment that isn't one of aidev's own [aidev]-style comments), the
 reply text is typed into the tmux session so Claude can continue.
@@ -16,7 +16,9 @@ import re
 import subprocess
 import sys
 import uuid
-from datetime import datetime
+import json
+import time
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import codex_runner, config, jira_client, state, procs, lockfile, github
@@ -26,42 +28,60 @@ from lib.soul import soul_section, jira_live_fetch_note
 
 log = get_logger("monitor")
 
-# The interactive Claude Code TUI prefixes every response line with a
-# leading marker glyph + space (e.g. "⏺ AIDEV_TASK_COMPLETE"), not just
-# whitespace like a bare `claude -p` run would — confirmed live on
-# RND-14813, whose session printed the marker correctly but sat
-# undetected for ~25 min across multiple cron cycles because `^\s*` does
-# not match `⏺ `. `[^\w\s]{0,3}\s*` absorbs up to a few leading
-# non-word/non-space decoration characters (covers `⏺`, `>`, `❯`, `-`,
-# bullets in general) before the marker/whitespace, without becoming so
-# permissive it matches the marker appearing mid-sentence in unrelated
-# prose (still requires the rest of the line to be just the marker).
-COMPLETE_RE = re.compile(r"(?m)^[^\w\s]{0,3}\s*AIDEV_TASK_COMPLETE\s*$")
-NEEDS_INPUT_RE = re.compile(r"(?m)^[^\w\s]{0,3}\s*AIDEV_NEEDS_INPUT:\s*(.+)$")
+
+STATUS_FILE_STALE_MINUTES = 60  # no update to status.json while "running" past
+                                 # this many minutes -> treat as stuck/crashed,
+                                 # BUT ONLY IF claude_process_alive also says the
+                                 # process is gone (see process_running_ticket) —
+                                 # a live process just means a long turn (parallel
+                                 # /simplify sub-agents, a big test suite, a slow
+                                 # Codex wait), not a crash. 10 min was too tight:
+                                 # traced live on RND-14840, whose session was
+                                 # continuously active (no gap over ~5 min in its
+                                 # own transcript, no OS crash report, no sleep/wake)
+                                 # but still got mark_failed'd 4 times in one day
+                                 # purely for not having written an incremental
+                                 # status.json update during one long turn/parallel
+                                 # sub-agent run — SOUL.md only asks for updates "at
+                                 # each meaningful transition," not on a fixed clock,
+                                 # so a healthy long turn legitimately produces gaps
+                                 # bigger than the old 10-minute window.
 
 
-def is_complete(pane):
-    return bool(COMPLETE_RE.search(pane))
+def read_status_file(worktree_path):
+    """Reads .claude-code/status.json — the ONLY completion/input signal
+    (no AIDEV_TASK_COMPLETE/AIDEV_NEEDS_INPUT marker text is scanned for
+    anymore; that regex-on-free-text approach had a real live bug — see
+    CLAUDE.md's "never regex a running process's free text" rule, plus a
+    documented near-miss of its own on RND-14813 with a leading TUI glyph).
+    Returns a dict with state/detail/updated_at, or None if missing/
+    unreadable/malformed. Never raises."""
+    path = os.path.join(worktree_path, ".claude-code", "status.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or "state" not in data:
+        return None
+    return data
 
 
-def find_needs_input(pane):
-    """Returns the most recent real AIDEV_NEEDS_INPUT question in the pane,
-    or None. Filters out the instructional placeholder line echoed from the
-    task prompt itself — caught live on RND-14813: a newer prompt template
-    used '<quote the part of the verdict...>' as its placeholder, which the
-    old '<your question' substring check didn't catch, so the ticket was
-    falsely marked STUCK on the prompt's own template text before Claude
-    ever ran. Every AIDEV_NEEDS_INPUT template in this file uses angle
-    brackets around its placeholder (<describe ...>, <quote ...>, <one line:
-    ...>) and a real answer from Claude never legitimately starts with '<'
-    and ends with '>' — so filter generically on that shape instead of one
-    hardcoded phrase, which will also cover any future template without
-    another special case here."""
-    def is_placeholder(m):
-        m = m.strip()
-        return m.startswith("<") and m.endswith(">")
-    matches = [m.strip() for m in NEEDS_INPUT_RE.findall(pane) if not is_placeholder(m)]
-    return matches[-1] if matches else None
+def status_file_is_stale(status):
+    """True if status['state'] == 'running' and updated_at is older than
+    STATUS_FILE_STALE_MINUTES — signals a likely crash, not legitimate
+    long-running work (which should keep re-writing 'running')."""
+    if not status or status.get("state") != "running":
+        return False
+    updated_at = status.get("updated_at")
+    if not updated_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.utcnow()
+    except (ValueError, TypeError):
+        return False
+    return (now - ts).total_seconds() > STATUS_FILE_STALE_MINUTES * 60
 
 
 def open_pr(ticket):
@@ -90,7 +110,7 @@ def open_pr(ticket):
     procs.sh(f"git push -u origin {branch}", cwd=worktree_path, check=False, timeout=600)
 
     # Normal case now: Claude opens its own PR (with a real title/description)
-    # before printing AIDEV_TASK_COMPLETE — reuse it rather than creating a
+    # before marking status.json complete — reuse it rather than creating a
     # second one.
     existing = procs.sh(
         f"gh pr view {branch} --json url --jq .url", cwd=worktree_path, check=False
@@ -141,6 +161,172 @@ def mark_failed(key, reason, tmux_name=None):
     notify(f"aidev: {key} failed", reason, key=key)
 
 
+def build_crash_retry_prompt(key, stage):
+    return f"""{soul_section()}You are resuming work on Jira ticket {key} after your previous session
+crashed mid-{stage} (the process died without writing a final status.json
+update — an unhandled error, an interrupted tool call, or similar).
+
+Check your own recent commits and any uncommitted changes in this worktree
+first — you may already have real progress that just needs to be picked up
+and continued, not redone from scratch. Continue from wherever you actually
+left off; don't assume you have to restart the whole stage.
+
+When done, write status.json's state to "complete" (or "needs_input" if you
+genuinely need a human, same rules as usual).
+"""
+
+
+HANDOFF_MARKER_STALE_MINUTES = 10  # if the requested handoff doc still hasn't
+                                    # appeared after this long, give up waiting
+                                    # and fall back to the normal crash-retry
+                                    # path instead of blocking this ticket
+                                    # forever on a request that may itself have
+                                    # gotten stuck
+
+
+def handoff_marker_path(worktree_path):
+    return os.path.join(worktree_path, ".claude-code", ".context_handoff_requested")
+
+
+def handoff_doc_path(worktree_path, key):
+    return os.path.join(worktree_path, ".claude-code", f"handoff-{key}.md")
+
+
+def build_context_handoff_request(key):
+    """Sent as a live tmux_send into an otherwise-healthy session whose
+    context usage just crossed the configured threshold — not a crash, so
+    this doesn't go through relaunch_claude/a fresh prompt file; it's typed
+    into the session exactly like a human's STUCK reply already is."""
+    doc_path = f".claude-code/handoff-{key}.md"
+    return (
+        f"Your context usage has crossed the configured handoff threshold. "
+        f"Before continuing, write a complete handoff document for the next "
+        f"session at {doc_path} (create it if it doesn't exist), covering: "
+        f"what you've done so far and why, the current state of the code/PR, "
+        f"what's left to do, any open questions or judgment calls you made, "
+        f"and exactly where to resume. Be thorough — the next session will "
+        f"have NO memory of this conversation and will rely entirely on this "
+        f"file plus the repo's own commits/decisions log. Once the file is "
+        f"written and saved, stop — do not do any further work in this "
+        f"session, a fresh session will take over from the handoff doc."
+    )
+
+
+def build_context_handoff_resume_prompt(key, stage, doc_rel_path, old_session_id):
+    return f"""{soul_section()}You are picking up Jira ticket {key} in a brand-new session. The
+previous session ({old_session_id}) was proactively retired after its context
+usage crossed the configured handoff threshold — it was still healthy, not
+crashed, and wrote a handoff document for you before stopping.
+
+Read {doc_rel_path} FIRST, in full, before doing anything else — it has the
+complete picture: what's been done, current state of the code/PR, what's left,
+and any open questions or judgment calls already made. Do not redo work it
+describes as already done; do not silently re-decide something it already
+decided unless you have a concrete reason to disagree (and if you do,
+document that in the same decisions-log convention SOUL.md already
+describes).
+
+After reading it, re-orient against the real live state too — `git log`,
+`git status`, `git diff` against the base branch, and the PR's current state
+via `gh pr view` — a handoff doc can describe intent accurately but still be
+a few minutes stale relative to CI/reviews.
+
+When done, write status.json's state to "complete" (or "needs_input" if you
+genuinely need a human, same rules as usual).
+"""
+
+
+def check_context_handoff(ticket):
+    """Proactively retires a healthy-but-context-heavy RUNNING session before
+    it has a chance to crash from sheer conversation size — this is a
+    distinct, EARLIER signal than the crash-retry logic elsewhere in this
+    file (which only reacts after something has already gone wrong). Traced
+    live on RND-14840: a --resume'd session sitting at 95%/1M tokens crashed
+    twice in a row shortly after; the fix that actually worked was starting
+    a genuinely fresh session rather than a third --resume of the same
+    bloated conversation. This automates exactly that recovery, triggered
+    proactively instead of reactively.
+
+    Returns True if it took an action this cycle (caller should not also run
+    its normal status-file checks against a session that's mid-handoff or
+    just got replaced), False if there's nothing to do.
+    """
+    cfg = config.load()
+    threshold = cfg["claude"].get("context_handoff_threshold")
+    if not threshold:
+        return False
+
+    key = ticket["ticket_key"]
+    worktree_path = ticket["worktree_path"]
+    tmux_name = ticket["tmux_session"]
+    session_id = ticket.get("session_id")
+
+    marker_path = handoff_marker_path(worktree_path)
+    doc_path = handoff_doc_path(worktree_path, key)
+
+    if os.path.exists(marker_path):
+        # Already requested — check whether the handoff doc has landed yet.
+        if os.path.exists(doc_path):
+            log(f"{key}: handoff doc written — replacing session (context handoff)")
+            old_session_id = session_id
+            stage = ticket.get("stage") or "implement"
+            doc_rel_path = os.path.relpath(doc_path, worktree_path)
+            prompt = build_context_handoff_resume_prompt(key, stage, doc_rel_path, old_session_id)
+            fresh_ticket = dict(ticket)
+            fresh_ticket["session_id"] = None  # forces relaunch_claude to mint --session-id, not --resume
+            new_session_id = relaunch_claude(fresh_ticket, prompt, stage=stage)
+            state.set_session_id(key, new_session_id)
+            state.clear_crash_retry_count(key)
+            try:
+                os.remove(marker_path)
+            except OSError:
+                pass
+            try:
+                jira_client.add_comment(
+                    key,
+                    f"[aidev] Context usage crossed {int(threshold * 100)}% — proactively replaced "
+                    f"the session with a fresh one to avoid a context-exhaustion crash. Old session "
+                    f"{old_session_id} wrote a handoff doc ({doc_rel_path}) before stopping; new "
+                    f"session {new_session_id} picked up from it.",
+                )
+            except Exception as e:
+                log(f"{key}: could not post handoff-replacement comment: {e}")
+            notify(
+                f"aidev: {key} session replaced (context handoff)",
+                f"Old session {old_session_id} -> new session {new_session_id}. "
+                f"Handoff doc: {doc_rel_path}",
+                key=key,
+                pr_url=ticket.get("pr_url"),
+            )
+            return True
+
+        # Still waiting on the handoff doc — give up after a while and let
+        # the normal crash-retry logic take over instead of blocking forever.
+        age_minutes = (time.time() - os.path.getmtime(marker_path)) / 60
+        if age_minutes > HANDOFF_MARKER_STALE_MINUTES:
+            log(f"{key}: handoff doc never appeared after {age_minutes:.0f}m — giving up on the "
+                f"handoff, falling back to normal crash handling")
+            try:
+                os.remove(marker_path)
+            except OSError:
+                pass
+            return False
+        log(f"{key}: waiting for handoff doc ({age_minutes:.0f}m)")
+        return True
+
+    pct = procs.read_context_usage_pct(worktree_path, session_id)
+    if pct is None or pct < threshold:
+        return False
+
+    log(f"{key}: context usage {pct:.0%} >= threshold {threshold:.0%} — requesting a handoff doc")
+    os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+    procs.tmux_send(tmux_name, build_context_handoff_request(key))
+    with open(marker_path, "w") as f:
+        f.write(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return True
+
+
+
 def process_running_ticket(ticket):
     cfg = config.load()
     key = ticket["ticket_key"]
@@ -151,12 +337,46 @@ def process_running_ticket(ticket):
         mark_failed(key, "tmux session disappeared while RUNNING (crash, reboot, or manual kill)")
         return
 
+    # Checked before the crash-detection logic below: this is a proactive,
+    # healthy-session handoff, not a reaction to something already broken.
+    # A session mid-handoff (marker written, doc not yet landed) is still a
+    # live, working `claude` process — the crash checks below would
+    # otherwise have nothing to distinguish it from a hung/dead one for the
+    # ~minutes it takes to write the handoff doc.
+    if check_context_handoff(ticket):
+        return
+
     if not procs.claude_process_alive(tmux_name):
+        # Same crash class as the status.json-staleness check further down
+        # (tmux alive, Claude process dead) — every real occurrence we've
+        # traced turned out to be a harmless process crash with a clean,
+        # safely-resumable worktree. Give it the same auto-retry budget
+        # before escalating to a human, rather than failing immediately —
+        # this check runs first and would otherwise bypass that retry logic
+        # entirely for the exact same failure mode.
+        retry_count = state.bump_crash_retry_count(key)
+        max_retries = cfg["claude"].get("max_crash_auto_retries", 1)
+        if retry_count <= max_retries:
+            log(f"{key}: claude process dead (crash retry {retry_count}/{max_retries}) — "
+                f"auto-relaunching same session/stage before giving up")
+            stage = ticket.get("stage") or "implement"
+            prompt = build_crash_retry_prompt(key, stage)
+            relaunch_claude(ticket, prompt, stage=stage)
+            try:
+                jira_client.add_comment(
+                    key,
+                    f"[aidev] Session crashed (claude process died) — auto-retrying "
+                    f"(attempt {retry_count}/{max_retries}) before escalating to a human.",
+                )
+            except Exception as e:
+                log(f"{key}: could not post crash-retry comment: {e}")
+            return
         mark_failed(
             key,
             "tmux session is alive but the claude process inside it is not — it crashed or exited "
             "(e.g. an unhandled API error) without finishing. The session's pane output up to that "
-            "point may still be useful context for a human or for a manual relaunch.",
+            f"point may still be useful context for a human or for a manual relaunch. "
+            f"(already auto-retried {max_retries} time(s), still crashing)",
         )
         return
 
@@ -169,10 +389,9 @@ def process_running_ticket(ticket):
         )
         return
 
-    pane = procs.tmux_capture(tmux_name, lines=300)
-
-    if is_complete(pane):
-        log(f"{key}: task complete marker seen, waiting for idle before postprocess")
+    status = read_status_file(ticket["worktree_path"])
+    if status and status.get("state") == "complete":
+        log(f"{key}: status.json reports complete, waiting for idle before postprocess")
         procs.wait_for_idle(
             tmux_name,
             cfg["claude"]["idle_seconds"],
@@ -181,10 +400,9 @@ def process_running_ticket(ticket):
         )
         finish_ticket(ticket)
         return
-
-    question = find_needs_input(pane)
-    if question:
-        log(f"{key}: needs input — {question}")
+    if status and status.get("state") == "needs_input" and status.get("detail"):
+        question = status["detail"]
+        log(f"{key}: status.json reports needs_input — {question}")
         state.set_stuck(key, question)
         try:
             jira_client.add_comment(
@@ -197,27 +415,101 @@ def process_running_ticket(ticket):
             log(f"{key}: could not post stuck comment: {e}")
         notify(f"aidev: {key} needs input", question, key=key, pr_url=ticket.get("pr_url"))
         return
+    if status_file_is_stale(status):
+        # Only treat this as a crash signal if the claude process is ALSO
+        # confirmed gone — claude_process_alive already ran above and we'd
+        # have returned there if it were dead, so reaching here with a stale
+        # status.json means the process is technically alive but hasn't
+        # written an incremental update in STATUS_FILE_STALE_MINUTES. Do NOT
+        # kill a live process over that alone: a long single turn (parallel
+        # /simplify sub-agents, a big test suite, a slow Codex wait) can
+        # legitimately go this long without a status.json write — SOUL.md
+        # only asks for updates "at each meaningful transition," not on a
+        # fixed clock. Re-check liveness explicitly (not just "we didn't
+        # return above a few lines ago") since staleness can be noticed on a
+        # LATER sweep than the alive-check ran on, and the process could have
+        # died in between.
+        if procs.claude_process_alive(tmux_name):
+            log(f"{key}: status.json stale but claude process is still alive — "
+                f"assuming a long turn, not a crash; not killing")
+            return
+        # status.json is the ONLY completion/input signal now (no marker-text
+        # fallback) — stuck on "running" past the staleness window with
+        # nothing else to check IS the crash signal, not just a maybe.
+        #
+        # Every real occurrence of this signal we've traced (RND-14818,
+        # RND-14824, RND-14825, RND-14845, all same day) turned out to be a
+        # genuine but harmless process crash (tmux alive, Claude process
+        # gone) with a clean, safely-resumable worktree — not corrupted
+        # work. Auto-retry once before giving up: same session (--resume),
+        # same stage, fresh status.json (relaunch_claude already resets it
+        # on every call). Only escalate to a real FAILED after repeated
+        # crashes on the SAME ticket, which is a genuinely different,
+        # worth-a-human-looking-at signal from "crashed once."
+        retry_count = state.bump_crash_retry_count(key)
+        max_retries = cfg["claude"].get("max_crash_auto_retries", 1)
+        if retry_count <= max_retries:
+            log(f"{key}: status.json stale (crash retry {retry_count}/{max_retries}) — "
+                f"auto-relaunching same session/stage before giving up")
+            stage = ticket.get("stage") or "implement"
+            prompt = build_crash_retry_prompt(key, stage)
+            relaunch_claude(ticket, prompt, stage=stage)
+            try:
+                jira_client.add_comment(
+                    key,
+                    f"[aidev] Session crashed (status.json went stale) — auto-retrying "
+                    f"(attempt {retry_count}/{max_retries}) before escalating to a human.",
+                )
+            except Exception as e:
+                log(f"{key}: could not post crash-retry comment: {e}")
+            return
+        mark_failed(
+            key,
+            f"status.json stuck on 'running' with no update in {STATUS_FILE_STALE_MINUTES}+ "
+            f"minutes — likely crashed or blocked without writing needs_input "
+            f"(already auto-retried {max_retries} time(s), still crashing)",
+            tmux_name=tmux_name,
+        )
+        return
+    if not status:
+        log(f"{key}: no status.json yet — still running")
+        return
 
     log(f"{key}: still running")
 
 
+SELF_REVIEW_LABEL = "aidev-self-review"
+CODEX_REVIEW_LABEL = "aidev-codex-review"
+
+
 def finish_ticket(ticket):
-    """Called when a RUNNING Claude session prints AIDEV_TASK_COMPLETE and
-    goes idle. What happens next depends on ticket['stage']:
-    - 'implement' (the normal first pass): push, open the PR (once — every
-      later stage just pushes to it), then relaunch Claude for 'self_review'
-      so /simplify, /custom-simplify, /custom-review run against a PR that
-      actually exists (custom-review tags it ai-reviewed and needs a real
-      PR number — running it before the PR existed silently no-op'd this).
-    - 'self_review': push whatever Claude changed, then run Codex as a
-      non-critical second opinion (see lib/codex_runner) and relaunch Claude
-      only if Codex left real findings; otherwise hand off to human review
-      directly. Bugbot does NOT run here — it runs once, at auto-merge time
-      (right before the PR actually lands in master), not on every review
-      pass, since a PR can sit in human review for a long time and running
-      it here too would just mean running it twice for the same commit.
-    - 'codex_check' (Claude just addressed Codex's findings, if any): push,
-      hand off to human review.
+    """Called when a RUNNING Claude session's status.json reports state
+    "complete" and it goes idle. What happens next depends on ticket['stage']:
+    - 'implement' (the normal first pass) and 'rework' (resumed after a
+      human sent the ticket back from review) share this path: push, open
+      /update the PR. Then check the `aidev-self-review` tag: present ->
+      relaunch Claude for 'self_review' so /custom-simplify, /custom-review
+      run against a PR that actually exists (custom-review
+      tags it ai-reviewed and needs a real PR number — running it before
+      the PR existed silently no-op'd this); absent -> skip self_review
+      entirely and go straight to the codex-tag check. `process_done_ticket`
+      re-applies `aidev-self-review` on rework entry when `auto_review` is
+      on, mirroring pickup's own first-pass behavior — the codex tag stays
+      manual-only on both paths, same as pickup.
+    - 'self_review': the tag just did its job — remove it (only after
+      success, so a crash mid-stage leaves it in place and the next sweep
+      retries; the tag's presence IS the retry state, no counter needed).
+      Push whatever Claude changed, then check the `aidev-codex-review`
+      tag: present -> run Codex as a non-critical second opinion (see
+      lib/codex_runner) and relaunch Claude only if Codex left real
+      findings; absent -> skip Codex, hand off to human review directly.
+      Bugbot does NOT run here — it runs once, at auto-merge time (right
+      before the PR actually lands in master), not on every review pass,
+      since a PR can sit in human review for a long time and running it
+      here too would just mean running it twice for the same commit.
+    - 'codex_check' (Claude just addressed Codex's findings, if any):
+      remove the `aidev-codex-review` tag (same after-success-only rule),
+      push, hand off to human review.
     - 'auto_merge*' (Claude just resolved a conflict or fixed a Bugbot
       finding as part of the auto-merge sequence): push, then re-enter the
       auto-merge check from the top (see continue_auto_merge).
@@ -229,6 +521,7 @@ def finish_ticket(ticket):
     stage = ticket.get("stage") or "implement"
 
     state.set_state(key, "POSTPROCESS")
+    state.clear_crash_retry_count(key)
     log(f"{key}: pushing / opening PR (stage={stage})")
     try:
         pr_url, pr_out = open_pr(ticket)
@@ -257,21 +550,109 @@ def finish_ticket(ticket):
         mark_review_done(ticket, pr_url, pr_out)
         return
 
-    if stage == "implement":
-        relaunch_for_stage(ticket, "self_review", pr_url,
-                            build_self_review_prompt, notice="running self-review (/simplify, "
-                            "/custom-simplify, /custom-review) now that the PR exists")
+    if stage == "implement" or stage == "rework":
+        if _has_label(key, SELF_REVIEW_LABEL):
+            post_steps = ", ".join(cfg["claude"]["post_steps"])
+            relaunch_for_stage(ticket, "self_review", pr_url,
+                                build_self_review_prompt,
+                                notice=f"running self-review ({post_steps}) "
+                                "now that the PR exists")
+        else:
+            log(f"{key}: {SELF_REVIEW_LABEL} not present — skipping self_review")
+            _proceed_past_self_review(ticket, pr_url)
         return
 
     if stage == "self_review":
-        run_codex_stage(ticket, pr_url)
+        _consume_label(key, SELF_REVIEW_LABEL)
+        _record_reviewed_sha(ticket)
+        _proceed_past_self_review(ticket, pr_url)
+        return
+
+    if stage == "codex_check":
+        _consume_label(key, CODEX_REVIEW_LABEL)
+        mark_review_done(ticket, pr_url, pr_out)
         return
 
     if stage.startswith("auto_merge"):
+        if stage == "auto_merge_recheck":
+            _record_reviewed_sha(ticket)
+        if stage == "auto_merge_addressing_pr_feedback":
+            _record_feedback_checked_sha(ticket)
         continue_auto_merge(ticket, pr_url)
         return
 
     mark_review_done(ticket, pr_url, pr_out)
+
+
+def _has_label(key, label):
+    try:
+        issue = jira_client.get_issue(key, fields=["labels"])
+        return label in (issue["fields"].get("labels") or [])
+    except Exception as e:
+        log(f"{key}: could not check labels ({label}): {e} — treating as absent")
+        return False
+
+
+def _consume_label(key, label):
+    """Removes a self-consuming review tag — call ONLY after its stage has
+    actually completed successfully. If this raises, the tag is left in
+    place and the next sweep simply retries the removal+stage; no separate
+    retry-counter needed, since presence/absence of the tag IS the retry
+    state."""
+    try:
+        jira_client.remove_label(key, label)
+    except Exception as e:
+        log(f"{key}: could not remove {label}: {e}")
+
+
+def _record_reviewed_sha(ticket):
+    """Records the worktree's actual current HEAD as the last-reviewed
+    commit — called right after a stage that genuinely ran /custom-review
+    finishes and pushed. Reads git directly, never Claude's own free-text
+    PR comment (that was a real, live bug — see set_last_reviewed_sha's
+    docstring). Best-effort: a git failure here just means the next
+    auto-merge cycle re-runs review once more, not a hard failure."""
+    key = ticket["ticket_key"]
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ticket["worktree_path"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        state.set_last_reviewed_sha(key, sha)
+    except Exception as e:
+        log(f"{key}: could not record reviewed SHA: {e}")
+
+
+def _record_feedback_checked_sha(ticket):
+    """Records the worktree's actual current HEAD as checked for unresolved
+    PR feedback — called right after auto_merge_addressing_pr_feedback
+    completes and pushed (whether Claude found something to fix, or found
+    nothing and just verified). This is the completion signal that closes
+    the loop opened by check_new_pr_feedback's relaunch: without it,
+    process_auto_merge_ticket would see the same (or a fixed, but
+    unmarked) head SHA as still-unchecked on every future cycle and
+    relaunch this stage forever — the exact class of bug the SHA-based
+    review-staleness fix addressed elsewhere in this file."""
+    key = ticket["ticket_key"]
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ticket["worktree_path"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip()
+        state.set_last_feedback_checked_sha(key, sha)
+    except Exception as e:
+        log(f"{key}: could not record feedback-checked SHA: {e}")
+
+
+def _proceed_past_self_review(ticket, pr_url):
+    """Shared by both the 'implement -> skip self_review' path and the
+    'self_review just finished' path: check the codex-review tag next."""
+    key = ticket["ticket_key"]
+    if _has_label(key, CODEX_REVIEW_LABEL):
+        run_codex_stage(ticket, pr_url)
+    else:
+        log(f"{key}: {CODEX_REVIEW_LABEL} not present — skipping codex, handing off to human review")
+        mark_review_done(ticket, pr_url)
 
 
 def relaunch_for_stage(ticket, next_stage, pr_url, prompt_builder, notice=None):
@@ -282,7 +663,7 @@ def relaunch_for_stage(ticket, next_stage, pr_url, prompt_builder, notice=None):
     except Exception:
         summary = key
     prompt = prompt_builder(key, summary, pr_url)
-    session_id = relaunch_claude(ticket, prompt)
+    session_id = relaunch_claude(ticket, prompt, stage=next_stage)
     with state.db() as conn:
         conn.execute(
             "UPDATE tickets SET session_id = ? WHERE ticket_key = ?",
@@ -290,6 +671,10 @@ def relaunch_for_stage(ticket, next_stage, pr_url, prompt_builder, notice=None):
         )
     state.set_stage(key, next_stage)
     state.reopen_for_rework(key)
+    try:
+        jira_client.set_state_label(key, "aidev-picked")
+    except Exception as e:
+        log(f"{key}: label warning: {e}")
     log(f"{key}: relaunched Claude for stage={next_stage} (session {session_id})")
     try:
         extra = f"\n{notice}." if notice else ""
@@ -318,6 +703,7 @@ def run_codex_stage(ticket, pr_url):
     ok, report_rel, detail = codex_runner.run_codex_review(ticket, key, summary, log=log)
     if not ok:
         log(f"{key}: codex review skipped ({detail}) — handing off to human review")
+        _consume_label(key, CODEX_REVIEW_LABEL)
         mark_review_done(ticket, pr_url)
         return
 
@@ -327,11 +713,13 @@ def run_codex_stage(ticket, pr_url):
             report_text = f.read()
     except OSError as e:
         log(f"{key}: codex report unreadable ({e}) — handing off to human review")
+        _consume_label(key, CODEX_REVIEW_LABEL)
         mark_review_done(ticket, pr_url)
         return
 
     if re.search(r"^##\s*Verdict:\s*CLEAN\b", report_text, re.MULTILINE):
         log(f"{key}: codex review clean — handing off to human review")
+        _consume_label(key, CODEX_REVIEW_LABEL)
         mark_review_done(ticket, pr_url)
         return
 
@@ -367,7 +755,7 @@ judgment calls — skip this) and `gh pr comment {pr_url} --body '...'` with it
 formatted per the "Post a decisions log as its own PR comment" section above
 (aidev decisions / My decisions).
 
-When done, say exactly: AIDEV_TASK_COMPLETE
+When done, write status.json's state to "complete".
 """
 
 
@@ -401,7 +789,7 @@ Stage and commit ALL changes with a clear commit message that references
 automatically — do not open a new PR). If you made no changes because
 there was nothing to fix, that's fine — just say so plainly.
 
-When done, say exactly: AIDEV_TASK_COMPLETE
+When done, write status.json's state to "complete".
 """
 
 
@@ -488,14 +876,17 @@ def process_stuck_ticket(ticket):
         log(f"{key}: label warning: {e}")
 
 
-def relaunch_claude(ticket, prompt):
-    """Starts a fresh Claude Code session in the ticket's existing worktree/
-    branch (used for rework after human review feedback). Returns the new
-    session_id."""
+def relaunch_claude(ticket, prompt, stage=None):
+    """Resumes the ticket's existing Claude Code session (same conversation
+    memory — no re-orientation cost) instead of minting a fresh one, unless
+    no prior session_id is on record (first-ever relaunch for this ticket),
+    in which case it falls back to a fresh --session-id. `stage` selects the
+    --model override from config.yaml's claude.models block, if set for that
+    stage; omitted/no match means no --model flag (account default)."""
     worktree_path = ticket["worktree_path"]
     tmux_name = ticket["tmux_session"]
     cfg = config.load()
-    session_id = str(uuid.uuid4())
+    prior_session_id = ticket.get("session_id")
 
     if procs.tmux_session_exists(tmux_name):
         procs.tmux_kill(tmux_name)
@@ -506,35 +897,84 @@ def relaunch_claude(ticket, prompt):
     with open(prompt_file, "w") as f:
         f.write(prompt)
 
+    # Reset status.json to a fresh "running" state stamped with *now*, not
+    # left holding whatever the previous (possibly crashed) session last
+    # wrote. Without this, a relaunch after a stale-status crash inherits an
+    # already-10-minutes-old timestamp, and the very next monitor sweep
+    # (every ~3 min) sees it as instantly stale again before the new Claude
+    # process has had any chance to write its own first update — a fast
+    # fail/relaunch/fail loop. Caught live: RND-14824 relaunched at 18:23:37,
+    # marked FAILED again at 18:24:00 (23 seconds later) on this exact bug.
+    status_file = os.path.join(worktree_path, ".claude-code", "status.json")
+    try:
+        with open(status_file, "w") as f:
+            json.dump(
+                {
+                    "state": "running",
+                    "detail": "resumed" if prior_session_id else "starting",
+                    "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                f,
+            )
+    except Exception as e:
+        log(f"{ticket['ticket_key']}: could not reset status.json on relaunch: {e}")
+
     skip_perms = "--dangerously-skip-permissions" if cfg["claude"]["dangerously_skip_permissions"] else ""
+    model = (cfg["claude"].get("models") or {}).get(stage) if stage else None
+    model_flag = f"--model {model} " if model else ""
+    if prior_session_id:
+        session_flag = f"--resume {prior_session_id}"
+        session_id = prior_session_id
+    else:
+        session_id = str(uuid.uuid4())
+        session_flag = f"--session-id {session_id}"
     claude_cmd = (
         f"cd {worktree_path} && "
-        f"DISABLE_AUTOUPDATER=1 claude --session-id {session_id} {skip_perms} "
+        f"DISABLE_AUTOUPDATER=1 claude {session_flag} {model_flag}{skip_perms} "
         f"\"$(cat .claude-code/.aidev_prompt.txt)\""
     )
-    procs.tmux_send(tmux_name, claude_cmd)
+    if not procs.launch_claude_verified(tmux_name, worktree_path, lambda: claude_cmd):
+        log(f"{ticket['ticket_key']}: claude never verifiably started in {worktree_path} "
+            f"after retrying — likely the shell-startup race (see procs.py)")
+    state.record_stage_transition(ticket["ticket_key"], session_id, stage or "implement", model)
     return session_id
 
 
-def build_rework_prompt(key, summary, feedback, pr_url):
+def build_rework_prompt(key, summary, pr_url):
+    """No `feedback` parameter — this is the same session (Step B --resume)
+    that implemented the ticket originally, so it already has conversation
+    memory of its own prior comments and doesn't need to be told which of
+    them to ignore. Mirrors build_task_prompt's minimal handoff style:
+    ticket key, a pointer, trust the session to read and judge live context
+    itself — including the PR, not just Jira, since rework happens on an
+    already-open PR that can independently have picked up new GitHub review
+    comments, a changed/failing CI run, or a merge conflict with master
+    since it was last touched."""
     steps = "\n".join(
         f"{i+1}. Run the slash command: {s}"
         for i, s in enumerate(config.load()["claude"]["post_steps"])
     )
     link = f"{config.load()['jira']['base_url']}/browse/{key}"
     live_fetch_note = jira_live_fetch_note(key, link)
-    return f"""{soul_section()}You are addressing human review feedback on Jira ticket {key}: {summary}
+    return f"""{soul_section()}You are resuming work on Jira ticket {key}: {summary}
 Link: {link}
+
+This is the same session that implemented this ticket originally — you have
+full memory of what you did and why. A human moved this ticket back to
+in-progress and/or commented, which means there's new feedback to address.
+You already know which of your own past comments to ignore; nothing here
+duplicates that.
 
 This ticket already has an open PR: {pr_url}
 You are in the same worktree and branch as before — the existing implementation
 is already committed and pushed. Do NOT start over or create a new branch.
 
-{live_fetch_note}
-This is the specific new feedback that triggered this rework session (detected
-fresh, not a stale snapshot) — but re-fetch the ticket per the note above too,
-in case anything else changed since:
-{feedback}
+Re-fetch and read what's changed, from BOTH sources, not just Jira:
+- Jira: {live_fetch_note}
+- The PR itself: run `gh pr view {pr_url}` for new review comments/threads,
+  `gh pr checks {pr_url}` for CI status, and check whether it still merges
+  cleanly against `master` (a merge conflict since you last touched this
+  can happen independently of any comment).
 
 If the original ticket referenced shared context files (repo root's
 `.claude-code/`, Notion pages via `/notion`, Slack links), re-check them for
@@ -543,7 +983,7 @@ decisions/learnings there — repo root's `.claude-code/`, not this worktree's
 (it gets deleted on cleanup), never overwrite existing content, only add.
 
 Task:
-- Make the changes needed to address the feedback above, in this worktree.
+- Make the changes needed to address whatever you find, in this worktree.
 - When done, run these steps in order:
 {steps}
 - Stage and commit ALL changes with a clear commit message that references {key}.
@@ -555,82 +995,57 @@ Task:
   not live-fetch: <reason>)".
 
 If you are blocked and need clarification, follow the same batching rule as
-the main implementation stage (see "`AIDEV_NEEDS_INPUT` fires at most once
+the main implementation stage (see "`needs_input` fires at most once
 per ticket" above): research, keep working with a provisional answer, log to
-`.claude-code/decisions-{key}.md`, and only print one batched
-`AIDEV_NEEDS_INPUT` at the end if anything is still open.
+`.claude-code/decisions-{key}.md`, and only write one batched
+status.json `needs_input` update at the end if anything is still open.
 
-When you are fully done, committed, and pushed, say exactly: AIDEV_TASK_COMPLETE
+When you are fully done, committed, and pushed, write status.json's state
+to "complete".
 """
-
-
-def gather_rework_feedback(ticket):
-    """Collects new review feedback from both Jira and the PR's GitHub
-    comments since this ticket last went DONE, and returns it as one
-    combined text block (or None if there's nothing new on either side).
-
-    Jira comment authored by us always starts "[aidev]"/"\u2705" (existing
-    convention); on GitHub the equivalent is the decisions-log comment,
-    which always starts "**aidev decisions" (see SOUL.md's "Post a decisions
-    log" section) \u2014 both are filtered out as our own output, not feedback.
-    A handful of routine bot/automation authors are filtered too so a
-    `@bugbot run` trigger comment or a CI bot post doesn't masquerade as
-    human feedback."""
-    key = ticket["ticket_key"]
-
-    jira_feedback = None
-    try:
-        issue = jira_client.get_issue(key, fields=["comment"])
-        for c in reversed(issue["fields"]["comment"]["comments"]):
-            text = jira_client.plain_description({"fields": {"description": c["body"]}})
-            if not text.strip().startswith("[aidev]") and not text.strip().startswith("\u2705"):
-                jira_feedback = text
-                break
-    except Exception as e:
-        log(f"{key}: could not fetch Jira comments for rework check: {e}")
-
-    github_feedback = None
-    try:
-        pr_comments = github.get_pr_comments(ticket["repo_path"], ticket.get("pr_url"))
-        bot_authors = {"github-actions", "cursor", "cursor-ai", "dependabot", "sonarqubecloud"}
-        # No time-window filter here on purpose: `since` (this ticket's DB
-        # updated_at, i.e. when it last flipped to DONE) is not reliable as
-        # a "before this = already seen" boundary — a human comment posted
-        # while a self-review session is still running lands BEFORE that
-        # session later sets DONE, so a `created_at <= since` cutoff would
-        # silently exclude it forever (confirmed live on RND-14814/PR #5802:
-        # a comment at 19:41 was swallowed because DONE didn't land until
-        # 19:58). Scanning newest-first and taking the first non-bot,
-        # non-self-authored comment is enough on its own — this function
-        # only runs at all when a human has already moved the ticket back
-        # to in_progress_status, so there is always genuinely something to
-        # look for, and picking up an older still-unaddressed comment here
-        # is correct behavior, not a false trigger.
-        for c in reversed(pr_comments):
-            author = (c.get("author") or {}).get("login", "")
-            body = (c.get("body") or "").strip()
-            if author.lower() in bot_authors:
-                continue
-            if body.startswith(("**aidev decisions", "## aidev decisions", "## Decisions log", "Decisions log")) or body.startswith("@bugbot"):
-                continue
-            if not body:
-                continue
-            github_feedback = f"(from {author} on the GitHub PR)\n{body}"
-            break
-    except Exception as e:
-        log(f"{key}: could not fetch PR comments for rework check: {e}")
-
-    parts = [p for p in (jira_feedback, github_feedback) if p]
-    return "\n\n---\n\n".join(parts) if parts else None
 
 
 def process_done_ticket(ticket):
     """DONE tickets whose Jira status was manually moved back to
     in_progress_status are review-feedback re-opens: relaunch Claude in the
-    same worktree/branch to address the feedback, then land back on
-    review_status + aidev-done via the normal finish_ticket path."""
+    same worktree/branch to address the feedback. Re-applies aidev-self-review
+    (per auto_review config) before relaunching so finish_ticket's shared
+    implement/rework path re-runs self-review the same way a first pass
+    would. aidev-auto-merge is a standing signature, not consumed by
+    rework — deliberately left untouched here, so once the rework lands
+    back on review_status + aidev-done via mark_review_done, the very next
+    DONE-sweep auto-merge check picks it back up and restarts the whole
+    approval sequence from the top (base/feedback/CI checks, then a fresh
+    Bugbot request), not from wherever it left off before rework.
+
+    Also checks, every cycle and independent of the `aidev-auto-merge`
+    label, whether the PR was merged directly on GitHub by a human — a
+    ticket never tagged for auto-merge (or merged while a rework/base check
+    was mid-flight) still needs its Jira ticket moved to Done and its
+    worktree cleaned up; nothing else in the pipeline watches for a plain
+    manual merge outside the auto-merge flow. Detected straight from the
+    PR's own `state` field via `gh`, never inferred from comment text."""
     cfg = config.load()
     key = ticket["ticket_key"]
+    pr_url = ticket.get("pr_url")
+
+    if pr_url:
+        details = github.get_pr_details(ticket["repo_path"], pr_url)
+        if details and details.get("state") == "MERGED":
+            log(f"{key}: PR already merged (by a human, outside auto-merge) — finishing up")
+            try:
+                jira_client.transition_issue(key, "Done")
+            except Exception as e:
+                log(f"{key}: could not transition to Done after human merge: {e}")
+            try:
+                jira_client.remove_label(key, AUTO_MERGE_LABEL)
+            except Exception as e:
+                log(f"{key}: could not remove {AUTO_MERGE_LABEL} label after human merge: {e}")
+            cleanup_worktree(ticket)
+            state.set_archived(key)
+            notify(f"aidev: {key} merged", "Merged directly on GitHub (not via auto-merge)",
+                   key=key, pr_url=pr_url)
+            return
 
     try:
         issue = jira_client.get_issue(key, fields=["status", "summary"])
@@ -644,14 +1059,16 @@ def process_done_ticket(ticket):
 
     log(f"{key}: moved back to {current_status} after DONE — treating as rework request")
 
-    feedback = gather_rework_feedback(ticket)
-    if not feedback:
-        feedback = "(No specific comment found — re-review the PR and address anything outstanding.)"
+    if cfg["claude"].get("auto_review", True):
+        try:
+            jira_client.add_label(key, SELF_REVIEW_LABEL)
+        except Exception as e:
+            log(f"{key}: could not re-apply {SELF_REVIEW_LABEL} for rework: {e}")
 
     summary = issue["fields"]["summary"]
-    prompt = build_rework_prompt(key, summary, feedback, ticket.get("pr_url") or "")
+    prompt = build_rework_prompt(key, summary, ticket.get("pr_url") or "")
 
-    session_id = relaunch_claude(ticket, prompt)
+    session_id = relaunch_claude(ticket, prompt, stage="rework")
     with state.db() as conn:
         conn.execute(
             "UPDATE tickets SET session_id = ? WHERE ticket_key = ?",
@@ -660,16 +1077,20 @@ def process_done_ticket(ticket):
     state.reopen_for_rework(key)
 
     try:
+        jira_client.set_state_label(key, "aidev-picked")
+    except Exception as e:
+        log(f"{key}: label warning (rework): {e}")
+    try:
         jira_client.add_comment(
             key,
             f"[aidev] Picked up your feedback, resuming work in the same worktree/branch.\n"
             f"Session ID: {session_id}",
         )
-        jira_client.set_state_label(key, "aidev-picked")
     except Exception as e:
         log(f"{key}: could not post rework comment: {e}")
 
-    notify(f"aidev: {key} rework started", feedback[:200], key=key, pr_url=ticket.get("pr_url"))
+    notify(f"aidev: {key} rework started", "resuming session with full memory of prior work",
+           key=key, pr_url=ticket.get("pr_url"))
 
 
 AUTO_MERGE_LABEL = "aidev-auto-merge"
@@ -725,13 +1146,13 @@ common case for a stacked PR whose sibling branches merged ahead of it.
 Verify the resolution actually builds/typechecks before committing (this
 repo's own convention — `npm run type:check` or equivalent). If the conflict
 is semantically ambiguous (the two sides changed the same behavior in
-different, incompatible ways) do NOT guess — print exactly:
-AIDEV_NEEDS_INPUT: <describe the ambiguous conflict, one line>
-and stop.
+different, incompatible ways) do NOT guess — write status.json with
+`state: "needs_input"` and `detail` describing the ambiguous conflict in one
+line, then stop.
 
 Otherwise, commit the resolution and push to the existing branch (this
-updates the existing PR — do not open a new PR), then say exactly:
-AIDEV_TASK_COMPLETE
+updates the existing PR — do not open a new PR), then write status.json's
+state to "complete".
 """
 
 
@@ -753,7 +1174,7 @@ threads for whatever you addressed (see the "Cursor Bugbot" section above
 for the `gh api graphql` commands).
 
 Commit and push to the existing branch (this updates the existing PR — do
-not open a new PR), then say exactly: AIDEV_TASK_COMPLETE
+not open a new PR), then write status.json's state to "complete".
 """
 
 
@@ -770,7 +1191,7 @@ again), do not comment `/approve` again; that's exactly the case the
 "unambiguous human review required" rule below is for, even if the verdict
 text itself doesn't use those words. Splitting the PR, or another concrete
 action, might be the real fix here — if you can't take that action
-yourself, this is a genuine AIDEV_NEEDS_INPUT case.
+yourself, this is a genuine needs_input case.
 """
     return f"""{soul_section()}You are handling Cursor's Approval Agent verdict on Jira ticket {key}: {summary}'s
 PR ({pr_url}), as part of an auto-merge sequence. You are in the same
@@ -806,19 +1227,19 @@ someone was tagged in passing).
   already done for this exact commit (you already ran custom-review, the
   label's already set, etc.) — do NOT comment `/approve` again. Nothing
   changed since the last ask, so asking again would just get the same
-  answer for no reason. Instead print exactly:
-AIDEV_NEEDS_INPUT: <one line: what the verdict says, why nothing here is actionable>
-  and stop.
+  answer for no reason. Instead write status.json with `state:
+  "needs_input"` and `detail`: one line on what the verdict says and why
+  nothing here is actionable, then stop.
 - Only if the verdict unambiguously states that a human review is required
   and already exists/is pending as the sole remaining path (not just "a
   reviewer is assigned" in passing) — do not comment `/approve` again, and
-  instead print exactly:
-AIDEV_NEEDS_INPUT: <quote the part of the verdict that says human review is required>
-  and stop.
+  instead write status.json with `state: "needs_input"` and `detail`:
+  quote the part of the verdict that says human review is required, then
+  stop.
 
 Otherwise, once you've taken whatever action applies (running a skill,
-committing/pushing if you changed anything, commenting `/approve`), say
-exactly: AIDEV_TASK_COMPLETE
+committing/pushing if you changed anything, commenting `/approve`), write
+status.json's state to "complete".
 """
 
 
@@ -879,23 +1300,22 @@ def _latest_review_matching(pr_details, marker):
     return matches[-1] if matches else None
 
 
-_BUGBOT_COMMIT_RE = re.compile(r"for commit ([0-9a-f]{7,40})")
-
-
 def _bugbot_review_commit(review):
-    """Extracts the commit SHA Bugbot's review body says it reviewed (its
-    boilerplate footer: "Reviewed by Cursor Bugbot for commit <sha>."), or
-    None if not found."""
+    """Returns the commit SHA Bugbot's review was actually submitted
+    against — read directly from GitHub's own `commit.oid` field on the
+    review object (`gh pr view --json reviews` already includes it), not
+    parsed out of Bugbot's free-text footer ("Reviewed by Cursor Bugbot for
+    commit <sha>."). That text is Cursor's own wording, not something we
+    control, and CLAUDE.md's "never regex a running process's free text"
+    rule applies here just as much as it did to the review-staleness bug —
+    GitHub already hands us the real value as structured data, so there was
+    never a need to re-derive it from prose in the first place."""
     if not review:
         return None
-    m = _BUGBOT_COMMIT_RE.search(review.get("body") or "")
-    return m.group(1) if m else None
+    return (review.get("commit") or {}).get("oid")
 
 
-_REVIEW_PASS_COMMIT_RE = re.compile(r"commits? (?:up to )?\b([0-9a-f]{7,40})\b")
-
-
-def _custom_review_covers_head(repo_path, pr_url, branch, head_sha):
+def _custom_review_covers_head(ticket, head_sha):
     """The `ai-reviewed` label (unlike Bugbot's review comment) carries no
     commit SHA — GitHub labels aren't tied to a commit, so once applied it
     stays applied forever even after new commits land (e.g. a conflict
@@ -905,28 +1325,27 @@ def _custom_review_covers_head(repo_path, pr_url, branch, head_sha):
     mirrors that same judgment in our own gate instead of trusting the label
     alone.
 
-    Finds our own last "aidev decisions: ... commit(s) [up to] <sha>" PR
-    comment (posted by the self_review/codex_check prompts) and requires
-    that reviewed commit to be EXACTLY the PR's current head — not merely an
-    ancestor of it. Ancestor-or-equal would be backwards here: if the
-    reviewed commit is an ancestor of head, head necessarily has MORE,
-    unreviewed commits on top of it (e.g. this same auto-merge run's own
-    conflict-resolution push) — that's precisely the stale case, not a
-    covered one. No matching comment counts as NOT covering head —
-    conservative by design, a false "needs re-review" is cheap (one extra
-    Claude pass) but a false "clean" would ship an unreviewed commit."""
+    Compares head_sha against ticket['last_reviewed_sha'] — a DB field set
+    directly from `git rev-parse HEAD` right when a review stage actually
+    completes (see _record_reviewed_sha/state.set_last_reviewed_sha). This
+    used to parse the exact reviewed commit out of Claude's own free-text
+    "aidev decisions: ... commit(s) [up to] <sha>" PR comment via regex —
+    a real, live bug: Claude phrased one comment "current HEAD 6d162f4"
+    instead of "commit 6d162f4", the regex silently stopped matching
+    forever, and RND-14813/PR #5759 cycled auto_merge_recheck 34 times over
+    ~19 hours before max_running_hours finally killed it. Free-running-text
+    from a process we don't control (Claude's own comment wording, just
+    like Cursor's/Bugbot's) is never a safe parse target — see CLAUDE.md's
+    "Never regex-parse a running process's free text" rule. No matching
+    recorded SHA counts as NOT covering head — conservative by design, a
+    false "needs re-review" is cheap (one extra Claude pass) but a false
+    "clean" would ship an unreviewed commit."""
     if not head_sha:
         return False
-    comments = github.get_pr_comments(repo_path, pr_url)
-    review_comments = [c for c in comments if (c.get("body") or "").startswith("**aidev decisions")]
-    if not review_comments:
+    reviewed_sha = ticket.get("last_reviewed_sha")
+    if not reviewed_sha:
         return False
-    last = review_comments[-1]
-    m = _REVIEW_PASS_COMMIT_RE.search(last.get("body") or "")
-    if not m:
-        return False
-    reviewed_sha = m.group(1)
-    return head_sha.startswith(reviewed_sha)
+    return head_sha == reviewed_sha
 
 
 def _last_approve_request_time(repo_path, pr_url):
@@ -976,12 +1395,12 @@ whatever applies) before touching anything. Common cases:
 
 If you fix something, commit and push to the existing branch (this updates
 the existing PR — do not open a new PR). If you're genuinely unsure what a
-failure means or how to address it, do not guess — print exactly:
-AIDEV_NEEDS_INPUT: <one line: which check, what's unclear>
-and stop.
+failure means or how to address it, do not guess — write status.json with
+`state: "needs_input"` and `detail`: one line on which check and what's
+unclear, then stop.
 
-Otherwise, once you've taken whatever action applies, say exactly:
-AIDEV_TASK_COMPLETE
+Otherwise, once you've taken whatever action applies, write status.json's
+state to "complete".
 """
 
 
@@ -991,9 +1410,30 @@ def _classify_checks(pr_details):
     conclusion yet (still running/queued) is pending, not failing — this
     pipeline should never treat "not done yet" as "broken"; only an
     explicit non-success conclusion counts as red and worth Claude's
-    attention."""
-    red, pending = [], []
+    attention.
+
+    De-dupes by check name first, keeping only the run with the latest
+    completedAt/startedAt. GitHub's rollup does NOT drop a superseded run
+    when a workflow is re-triggered by a label change (only a new push
+    reliably does that) — a `labeled`/`unlabeled` re-run of the same check
+    name can leave an old FAILURE run sitting in the rollup right alongside
+    a newer SUCCESS/SKIPPED one for the identical check. Caught live on PR
+    #5779/RND-14816: the "changelog" check had a stale FAILURE from before
+    the `no-changelog` label was applied, and a fresh SKIPPED run from 3
+    seconds after — both present in the same rollup response. Without this
+    de-dupe, the stale entry alone caused an infinite relaunch loop (every
+    ~3 min, forever) even though the check had already genuinely passed."""
+    latest_by_name = {}
     for c in pr_details.get("statusCheckRollup", []):
+        name = c.get("name")
+        if not name:
+            continue
+        ts = c.get("completedAt") or c.get("startedAt") or ""
+        if name not in latest_by_name or ts > (latest_by_name[name].get("completedAt") or latest_by_name[name].get("startedAt") or ""):
+            latest_by_name[name] = c
+
+    red, pending = [], []
+    for c in latest_by_name.values():
         conclusion = (c.get("conclusion") or "").upper()
         status = (c.get("status") or "").upper()
         if conclusion in ("SUCCESS", "SKIPPED", "NEUTRAL"):
@@ -1006,6 +1446,54 @@ def _classify_checks(pr_details):
         else:
             pending.append(c)
     return red, pending
+
+
+def check_new_pr_feedback(ticket, pr_url, head_sha):
+    """Judgment call, not a text/author heuristic (per CLAUDE.md's "never
+    regex a running process's free text" rule): hands Claude every current
+    PR comment and review verbatim and asks it to decide whether anything
+    substantive is still unaddressed at the current HEAD — a human comment
+    with no Jira status change (invisible to process_done_ticket's rework
+    path), or a Bugbot finding that's about to become stale and get
+    silently superseded by a fresh run without ever having been read.
+    Always relaunches (the caller always returns right after calling this)
+    — the SHA is marked checked later, in finish_ticket, once this
+    relaunched session actually completes and pushes
+    (_record_feedback_checked_sha), not here."""
+    def prompt_builder(key, summary, pr_url):
+        return build_pr_feedback_check_prompt(key, summary, pr_url, head_sha)
+
+    log(f"{ticket['ticket_key']}: auto-merge — checking for unresolved PR feedback before continuing")
+    relaunch_for_stage(ticket, "auto_merge_addressing_pr_feedback", pr_url, prompt_builder,
+                        notice="auto-merge — checking whether any PR comment/review still needs addressing")
+
+
+def build_pr_feedback_check_prompt(key, summary, pr_url, head_sha):
+    return f"""{soul_section()}You are about to continue the auto-merge sequence for Jira ticket
+{key}: {summary}, PR: {pr_url}, at commit {head_sha}. Before anything else runs (Bugbot,
+approval), read every comment and review currently on this PR yourself:
+
+    gh pr view {pr_url} --json comments,reviews
+
+Some of these are your own past output (decisions-log comments, rework acknowledgments) —
+you'll recognize your own voice/format; don't treat those as feedback to act on. Everything
+else — a human's line comment or review, or a Bugbot/Cursor finding from an earlier commit
+that nobody has actually addressed yet — is what you're checking for.
+
+Decide for yourself, reading the actual content, whether there is real substantive feedback
+here that hasn't been resolved by the current code at HEAD. Don't pattern-match specific
+words or authors — read it the way a human reviewer coming back to this PR would, and use
+your own judgment about what still needs doing versus what's already handled or superseded.
+
+- If you find something real and unaddressed: fix it (or explain in a PR comment why you're
+  not, if you genuinely disagree), commit, and push to this same branch — do not open a new
+  PR or start over.
+- If everything you find is either already resolved by the current code, is your own past
+  output, or is genuinely stale (e.g. an old Bugbot finding whose flagged code no longer
+  exists), say so briefly and do nothing else.
+
+When done, write status.json's state to "complete".
+"""
 
 
 def process_auto_merge_ticket(ticket):
@@ -1049,17 +1537,88 @@ def process_auto_merge_ticket(ticket):
         log(f"{key}: could not fetch PR details this cycle, will retry")
         return
 
+    # --- already merged by a human, outside this flow ---------------------
+    # A human can merge the PR directly on GitHub at any point (e.g. while
+    # auto-merge is mid-sequence, or before it ever ran) — that's a valid
+    # way to finish a ticket, not an error. Detect it directly from the PR's
+    # own `state` field (never inferred from prose/comments), transition
+    # Jira to Done the same way the bot's own merge path does below, and
+    # clean up the worktree immediately rather than waiting for the
+    # terminal-Jira-status cleanup sweep to notice on its next cycle.
+    if details.get("state") == "MERGED":
+        log(f"{key}: PR already merged (by a human, outside auto-merge) — finishing up")
+        try:
+            jira_client.transition_issue(key, "Done")
+        except Exception as e:
+            log(f"{key}: could not transition to Done after human merge: {e}")
+        try:
+            jira_client.remove_label(key, AUTO_MERGE_LABEL)
+        except Exception as e:
+            log(f"{key}: could not remove {AUTO_MERGE_LABEL} label after human merge: {e}")
+        cleanup_worktree(ticket)
+        state.set_archived(key)
+        notify(f"aidev: {key} merged", "Merged directly on GitHub (not via auto-merge)",
+               key=key, pr_url=pr_url)
+        return
+
     if details["baseRefName"] != "master":
         log(f"{key}: auto-merge — base is {details['baseRefName']}, not master yet, skipping")
         return
 
     log(f"{key}: auto-merge — base is master, proceeding")
 
+    # --- unresolved feedback check ---------------------------------------
+    # Before touching Bugbot at all: is there human feedback, or a stale
+    # Bugbot finding from before this pass, that nobody has actually acted
+    # on yet? A GitHub-only comment (no Jira status change) is invisible to
+    # process_done_ticket's rework path, so without this check it would
+    # never be surfaced to Claude at all — self_review doesn't read PR
+    # comments, and by the time auto-merge's own Bugbot loop runs, an old
+    # Bugbot review is simply superseded by a fresh one, its actual text
+    # never read by anything. Gated on head_sha, not a boolean, so a later
+    # push re-triggers this — same pattern as last_reviewed_sha. The SHA is
+    # marked checked from finish_ticket once the relaunched session
+    # actually completes and pushes (_record_feedback_checked_sha), not
+    # here — this call always relaunches and returns, so marking it here
+    # would never run and this stage would loop forever.
+    head_sha_for_feedback = details.get("headRefOid", "")
+    if head_sha_for_feedback and ticket.get("last_feedback_checked_sha") != head_sha_for_feedback:
+        check_new_pr_feedback(ticket, pr_url, head_sha_for_feedback)
+        return
+
     # --- conflict check -------------------------------------------------
     if details["mergeable"] == "CONFLICTING" or details["mergeStateStatus"] == "DIRTY":
         log(f"{key}: auto-merge — merge conflict, relaunching Claude to resolve")
         relaunch_for_stage(ticket, "auto_merge_resolving_conflict", pr_url, build_auto_merge_conflict_prompt,
                             notice="auto-merge hit a conflict with master — resolving it")
+        return
+
+    # --- CI checks: red is Claude's to judge, yellow is just a wait ------
+    # Runs BEFORE Bugbot deliberately: no point spending a Bugbot review
+    # cycle (and burning its request quota/wait time) against code that's
+    # already known-broken by the repo's own test suite — fix real
+    # failures first, then let Bugbot review the actually-final code once.
+    # Caught live on PR #5814/RND-14828: Bugbot was triggered while
+    # run-tests/unit-ui was still FAILURE, because CI used to be checked
+    # only after the Bugbot loop.
+    # No hardcoded "changelog specifically means X" branch here — a check
+    # being red (failing tests, lint, changelog enforcer, anything) is not
+    # automatically "stuck"; Claude reads the actual failures and decides
+    # what to do, same non-deterministic pattern as the Bugbot/approval
+    # gates. Only a check still queued/running is a genuine "wait, not
+    # broken" — never treated as needing Claude's attention.
+    red_checks, pending_checks = _classify_checks(details)
+    if red_checks:
+        log(f"{key}: auto-merge — {len(red_checks)} check(s) red "
+            f"({', '.join(c['name'] for c in red_checks)}), relaunching Claude to judge them")
+        def ci_prompt_builder(key, summary, pr_url, _checks=red_checks):
+            return build_auto_merge_ci_failure_prompt(key, summary, pr_url, _checks)
+        relaunch_for_stage(ticket, "auto_merge_fixing_ci", pr_url, ci_prompt_builder,
+                            notice=f"auto-merge — {len(red_checks)} CI check(s) red, judging and addressing them")
+        return
+    if pending_checks:
+        log(f"{key}: auto-merge — {len(pending_checks)} check(s) still running "
+            f"({', '.join(c['name'] for c in pending_checks)}), waiting")
         return
 
     # --- bugbot loop ------------------------------------------------------
@@ -1147,32 +1706,11 @@ def process_auto_merge_ticket(ticket):
         )
         return
 
-    if not _custom_review_covers_head(repo_path, pr_url, branch, details.get("headRefOid", "")):
+    if not _custom_review_covers_head(ticket, details.get("headRefOid", "")):
         log(f"{key}: auto-merge — '{REQUIRED_LABEL}' label is stale (commits landed since the "
             f"last /custom-review pass, e.g. a conflict-resolution push) — re-running review")
         relaunch_for_stage(ticket, "auto_merge_recheck", pr_url, build_self_review_prompt,
                             notice="auto-merge — re-running /custom-review, PR changed since the last pass")
-        return
-
-    # --- CI checks: red is Claude's to judge, yellow is just a wait ------
-    # No hardcoded "changelog specifically means X" branch here — a check
-    # being red (failing tests, lint, changelog enforcer, anything) is not
-    # automatically "stuck"; Claude reads the actual failures and decides
-    # what to do, same non-deterministic pattern as the Bugbot/approval
-    # gates. Only a check still queued/running is a genuine "wait, not
-    # broken" — never treated as needing Claude's attention.
-    red_checks, pending_checks = _classify_checks(details)
-    if red_checks:
-        log(f"{key}: auto-merge — {len(red_checks)} check(s) red "
-            f"({', '.join(c['name'] for c in red_checks)}), relaunching Claude to judge them")
-        def ci_prompt_builder(key, summary, pr_url, _checks=red_checks):
-            return build_auto_merge_ci_failure_prompt(key, summary, pr_url, _checks)
-        relaunch_for_stage(ticket, "auto_merge_fixing_ci", pr_url, ci_prompt_builder,
-                            notice=f"auto-merge — {len(red_checks)} CI check(s) red, judging and addressing them")
-        return
-    if pending_checks:
-        log(f"{key}: auto-merge — {len(pending_checks)} check(s) still running "
-            f"({', '.join(c['name'] for c in pending_checks)}), waiting")
         return
 
     # --- approval ---------------------------------------------------------
@@ -1268,9 +1806,24 @@ def continue_auto_merge(ticket, pr_url):
     else on this path ever sets it back. Caught live: RND-14813 silently
     dropped out of every future `state.all_in_state("DONE")` auto-merge
     sweep after its conflict-resolution relaunch, since it was sitting in
-    PR_OPENED, not DONE, and the sweep only iterates DONE tickets."""
+    PR_OPENED, not DONE, and the sweep only iterates DONE tickets.
+
+    Must ALSO restore the `aidev-done` Jira label: relaunch_for_stage (used
+    by every auto_merge_* sub-stage, including this one's own relaunches)
+    unconditionally calls set_state_label(key, "aidev-picked"), which is
+    mutually exclusive with aidev-done and silently strips it. process_auto_
+    merge_ticket's own entry gate requires aidev-done present (a deliberate
+    safety check — never touch running work) — without restoring it here,
+    the very first auto-merge relaunch permanently locks the ticket out of
+    its own gate, and every future sweep logs "not In Review + aidev-done"
+    and skips it forever. Caught live: RND-14818 and RND-14830 both stuck on
+    exactly this silent loop after their first auto_merge relaunch."""
     key = ticket["ticket_key"]
     state.set_state(key, "DONE", pr_url=pr_url)
+    try:
+        jira_client.set_state_label(key, "aidev-done")
+    except Exception as e:
+        log(f"{key}: could not restore aidev-done label after auto-merge relaunch: {e}")
     ticket = state.get(key)
     state.set_stage(key, "auto_merge_recheck")
     process_auto_merge_ticket(ticket)

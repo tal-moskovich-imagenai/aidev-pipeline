@@ -24,12 +24,32 @@ best-effort (ok: bool, report_path_or_None, detail: str) and must proceed
 without blocking the pipeline on Codex specifically.
 """
 import os
+import re
 import subprocess
 
 from . import config
 
 
+def _codex_skill_names():
+    """Codex only has `custom-simplify`/`custom-review` installed as native
+    plugins (see module docstring) — NOT `/simplify` (Claude's own 4-way
+    fork-review skill), which config.yaml's `claude.post_steps` may also
+    list for Claude's own use. Select these two by name out of
+    `post_steps`, not by position/count: `post_steps` is Claude's list and
+    can grow other entries (like `/simplify`) that have nothing to do with
+    what Codex has installed. Raises if either expected name is missing —
+    the rest of this prompt hardcodes distinct, skill-specific instructions
+    for exactly these two skills, so a `post_steps` that drops one of them
+    should fail loudly here rather than mismatch silently."""
+    names = {s.lstrip("/") for s in config.load()["claude"]["post_steps"]}
+    missing = {"custom-simplify", "custom-review"} - names
+    if missing:
+        raise ValueError(f"claude.post_steps is missing expected Codex skill(s): {sorted(missing)}")
+    return "custom-simplify", "custom-review"
+
+
 def build_codex_review_prompt(key, summary, report_path):
+    simplify_skill, review_skill = _codex_skill_names()
     return f"""You are a second-opinion code reviewer on Jira ticket {key}: {summary},
 running as `codex exec` in this git worktree/branch alongside a primary
 implementer (Claude Code) and an automated bot (Cursor Bugbot).
@@ -40,12 +60,12 @@ in this repository. Do not run `git commit`, `git add`, or anything that
 changes the working tree's tracked content. The one file you may write is
 the report path given below.
 
-You have the `custom-simplify` and `custom-review` skills installed — the
-same ones Claude Code runs as `/custom-simplify` and `/custom-review` on
+You have the `{simplify_skill}` and `{review_skill}` skills installed — the
+same ones Claude Code runs as `/{simplify_skill}` and `/{review_skill}` on
 this same diff. In this session, invoke them with Codex's own skill syntax:
 
-$custom-simplify
-$custom-review
+${simplify_skill}
+${review_skill}
 
 Actually follow their documented procedures step by step when they run, not
 a paraphrase of them. If invoking them this way doesn't work in this
@@ -55,14 +75,14 @@ invocation syntax failed.
 
 Then, in order:
 
-1. Run `custom-simplify`'s procedure against this diff: classify every
+1. Run `{simplify_skill}`'s procedure against this diff: classify every
    comment added in the diff per its Step 1 table, and check for the
    readability issues its later steps cover (extract-worthy sections,
    KISS/DRY/module-separation problems) in the code that changed. You will
    not edit anything — instead, for each comment/section that the skill's
    own criteria say should be converted, deleted, or extracted, record it
    as a finding: what the skill's rule says, and what change it implies.
-2. Run `custom-review`'s procedure: read the repo's own conventions
+2. Run `{review_skill}`'s procedure: read the repo's own conventions
    (CLAUDE.md, AGENTS.md, .agents/rules/*) the skill tells you to load, and
    check the diff against them the way that skill directs, plus general
    correctness concerns a careful reviewer would flag.
@@ -79,10 +99,10 @@ Use this structure, with the two skills as separate sections so Claude can
 tell which procedure surfaced which finding:
 # Codex Review — {key}
 ## Verdict: CLEAN | NEEDS_ATTENTION
-## Simplify findings (from custom-simplify)
+## Simplify findings (from {simplify_skill})
 (one item per issue: `file:line`, what the skill's rule says, suggested
  change — or "No findings." if genuinely clean)
-## Review findings (from custom-review)
+## Review findings (from {review_skill})
 (one item per issue: `file:line`, severity, what's wrong, suggested fix —
  or "No findings." if genuinely clean)
 
@@ -103,6 +123,15 @@ def run_codex_review(ticket, key, summary, log=lambda *a, **k: None):
         return False, None, "codex review disabled in config"
 
     worktree_path = ticket["worktree_path"]
+    min_diff_lines = codex_cfg.get("min_diff_lines", 0)
+    if min_diff_lines:
+        changed_lines = _diff_line_count(worktree_path, log, key)
+        if changed_lines is not None and changed_lines < min_diff_lines:
+            return False, None, (
+                f"diff too small to warrant Codex ({changed_lines} < "
+                f"{min_diff_lines} changed lines) — relying on the /custom-review "
+                f"pass already run during self_review"
+            )
     timeout = codex_cfg.get("timeout_seconds", 1800)
     sandbox = codex_cfg.get("sandbox", "workspace-write")
     report_dir = codex_cfg.get("report_dir", ".claude-code")
@@ -143,6 +172,36 @@ def run_codex_review(ticket, key, summary, log=lambda *a, **k: None):
         return False, None, f"codex exec finished but wrote no report; last output: {tail}"
 
     return True, report_rel, "ok"
+
+
+def _diff_line_count(worktree_path, log, key):
+    """Total changed lines (additions + deletions) vs. the branch's merge
+    base with its upstream/parent — best-effort: falls back to `master` if
+    no upstream is configured, and returns None (never gates) on any
+    failure, since this is purely an optimization, not a correctness check."""
+    try:
+        base = subprocess.run(
+            ["git", "merge-base", "HEAD", "master"], cwd=worktree_path,
+            capture_output=True, text=True, timeout=15, check=False,
+        ).stdout.strip()
+        if not base:
+            return None
+        result = subprocess.run(
+            ["git", "diff", "--shortstat", base, "HEAD"], cwd=worktree_path,
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        # e.g. " 3 files changed, 12 insertions(+), 4 deletions(-)"
+        total = 0
+        for part in result.stdout.split(","):
+            m = re.search(r"(\d+)\s+(?:insertion|deletion)", part)
+            if m:
+                total += int(m.group(1))
+        return total
+    except Exception as e:
+        log(f"{key}: could not compute diff size for codex skip-gate: {e}")
+        return None
 
 
 def _revert_stray_changes(worktree_path, keep_rel_path, log, key):

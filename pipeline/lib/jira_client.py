@@ -68,9 +68,10 @@ def get_blocking_issues(key, review_status=None):
     `hard=True` means the blocker has not yet reached `review_status` (or no
     review_status was given) — the ticket must wait, full stop.
     `hard=False` means the blocker is sitting exactly at `review_status`
-    (e.g. "In Review") — not merged yet, but far enough along that a caller
-    may choose to proceed by stacking a new branch on top of the blocker's
-    own branch instead of waiting for it to reach a terminal status.
+    (e.g. "In Review") — not merged yet, but far enough along (PR open, base
+    branch stable enough to minimize conflicts) that a caller may choose to
+    proceed by stacking a new branch on top of the blocker's own branch
+    instead of waiting for it to reach a terminal status.
     """
     issue = get_issue(key, fields=["issuelinks"])
     blockers = []
@@ -282,6 +283,13 @@ def remove_label(key, label):
     list wholesale once wiped a pipeline-managed label that had been added
     between the read and the write)."""
     _request("PUT", f"/rest/api/3/issue/{key}", body={"update": {"labels": [{"remove": label}]}})
+
+
+def add_label(key, label):
+    """Adds exactly one label, leaving every other label untouched. Same
+    atomic `update.labels[].add` op as remove_label's `.remove` — no
+    read-modify-write race."""
+    _request("PUT", f"/rest/api/3/issue/{key}", body={"update": {"labels": [{"add": label}]}})
 
 
 def get_comments(key):

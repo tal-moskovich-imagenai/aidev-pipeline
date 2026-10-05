@@ -51,12 +51,14 @@ def get_pr_comments(repo_path, pr_url):
 def get_pr_details(repo_path, pr_url):
     """Returns the PR's current state for the auto-merge flow: base branch,
     mergeable/mergeStateStatus, labels, required-check rollup, reviews (in
-    submission order), and requested reviewers. Returns None on any failure
+    submission order), requested reviewers, and the PR's own open/closed/
+    merged `state` (used to detect a human merging directly on GitHub,
+    outside the auto-merge flow entirely). Returns None on any failure
     — callers should treat that as "can't act this cycle, try again later",
     not as a terminal condition."""
     if not pr_url:
         return None
-    fields = "baseRefName,number,headRefOid,labels,mergeable,mergeStateStatus,statusCheckRollup,reviews,reviewRequests"
+    fields = "baseRefName,number,headRefOid,labels,mergeable,mergeStateStatus,statusCheckRollup,reviews,reviewRequests,state"
     out = procs.sh(f"gh pr view {procs.shlex.quote(pr_url)} --json {fields}", cwd=repo_path, check=False)
     if not out:
         return None

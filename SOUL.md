@@ -42,7 +42,7 @@ than stopping to ask, because:
 - A wrong-but-documented choice is trivially fixed in review
 - Most implementation details genuinely don't need a human's input
 
-**Ask (`AIDEV_NEEDS_INPUT`) only when the decision is:**
+**Ask (writes `status.json` `state: "needs_input"`) only when the decision is:**
 - A **business/product call** you have no way to infer from the ticket, repo
   conventions, or codebase precedent (e.g. "should this be opt-in or
   opt-out", "what should the default limit be", "which of these two UX
@@ -66,12 +66,41 @@ When you do decide instead of asking, treat the decision as provisional and
 say so: state the assumption plainly in the commit/PR so a reviewer can
 correct it in one comment instead of archaeology.
 
-## `AIDEV_NEEDS_INPUT` fires at most once per ticket
+## `needs_input` fires at most once per ticket
 
 Every judgment call — confident or not — gets logged as you make it: append a
 line to `.claude-code/decisions-<TICKET>.md` (create it if missing) with what
 you decided and why. This file is the running record of the whole ticket, not
 just an escalation queue.
+
+## Status file — `.claude-code/status.json` is the ONLY completion/input signal
+
+There is no `AIDEV_TASK_COMPLETE`/`AIDEV_NEEDS_INPUT` marker text anymore —
+the orchestrator does not scan your output for any special phrase. The
+**only** way it learns your state is by reading `.claude-code/status.json`
+in this worktree. Keep it updated **incrementally, at each meaningful
+transition** — not only once at the very end. A crash mid-stage should still
+leave a current, useful file on disk, not nothing. Write it as JSON with
+exactly these keys:
+
+```json
+{"state": "running", "detail": "", "updated_at": "<ISO 8601 UTC timestamp>"}
+```
+
+- Write `{"state": "running", ...}` right after you start.
+- Write `{"state": "complete", ...}` when you are fully done — committed,
+  pushed, and (for the implement stage) the PR is open with a real title
+  and description. This is your entire signal to the orchestrator that
+  it's safe to move on — nothing else to print, nothing else to say.
+- Write `{"state": "needs_input", "detail": "<the question(s)>", ...}` when
+  you're genuinely blocked per the rules below. `detail` is the real
+  question text, verbatim — the orchestrator posts it to Jira exactly as
+  written, so make it a complete, standalone sentence.
+
+`updated_at` must be the real current time at each write — the orchestrator
+uses staleness (no update for several minutes while `state` is `running`) to
+tell "still working" apart from "crashed." A stale timestamp defeats the
+whole point and will get the ticket marked failed.
 
 When you hit something that actually clears the "ask" bar above: do the
 research anyway, form a real suggested answer, and **keep implementing using
@@ -80,13 +109,12 @@ Append it to an "Open questions" section in the same decisions file, with
 your research and suggested answer, not just the bare question.
 
 Only at the very end — right before you'd otherwise commit/push/open the PR —
-check that file. If "Open questions" is non-empty, print exactly ONE
-`AIDEV_NEEDS_INPUT` covering all of them together, e.g.:
+check that file. If "Open questions" is non-empty, write ONE `status.json`
+update covering all of them together, `state: "needs_input"` with `detail`
+as one combined string, e.g.:
 
-```
-AIDEV_NEEDS_INPUT:
-1. <question> — my read: <suggested answer>. Proceeding with this unless you say otherwise.
-2. <question> — my read: <suggested answer>. Proceeding with this unless you say otherwise.
+```json
+{"state": "needs_input", "detail": "1. <question> — my read: <suggested answer>. Proceeding with this unless you say otherwise. 2. <question> — my read: <suggested answer>. Proceeding with this unless you say otherwise.", "updated_at": "..."}
 ```
 
 Then wait. When the human replies, reconcile: fix anything they answered
@@ -96,9 +124,9 @@ provisional default — note that in the decisions file too.
 The only exception: you genuinely cannot produce *any* reasonable code
 without an answer (not "unsure which is better" — "no path forward exists").
 Even then, prefer stubbing/branching/scaffolding around it to keep the single
-end-of-ticket batch intact. If truly nothing else is left to do, fire
-`AIDEV_NEEDS_INPUT` immediately instead of stalling on an empty session — but
-this should be rare.
+end-of-ticket batch intact. If truly nothing else is left to do, write
+`status.json`'s `state: "needs_input"` immediately instead of stalling on an
+empty session — but this should be rare.
 
 ## What "done" means
 
@@ -127,20 +155,17 @@ half-solution.
 
 Once the PR exists (during `self_review`, the same stage that already runs
 `/custom-review` and tags the PR `ai-reviewed`), post the contents of
-`.claude-code/decisions-<TICKET>.md` as its own PR comment, structured in two
-sections:
-
-- **aidev decisions** — the confident judgment calls you made autonomously,
-  with your reasoning. This is what already lives in the commit/PR
-  description in prose form, made scannable as a list instead.
-- **My decisions** — the resolved "Open questions": the question, what the
-  human answered (or, if they didn't respond to a given item, your
-  provisional default that shipped), one line each.
+`.claude-code/decisions-<TICKET>.md` as its own PR comment — but keep it
+short: **max 5 bullet lines total, each ≤15 words.** Format:
+`- <what changed>: <why, if non-obvious>` — no diff restatement, no code
+blocks, no restating the ticket description. **Skip posting the comment
+entirely if there's nothing non-obvious to say** — a log entry that just
+restates "implemented the ticket" is worse than no comment at all; silence
+is a valid outcome.
 
 This is a separate comment from the PR description, not a replacement for it
 — a reviewer skimming for "what do I need to sanity-check" should be able to
-read this list in seconds instead of parsing narrative prose. Keep it terse:
-one line per decision, not a restatement of the whole diff.
+read this list in seconds instead of parsing narrative prose.
 
 ## Cursor Bugbot — auto-merge time, not every review pass
 
