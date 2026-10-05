@@ -235,6 +235,7 @@ def pickup_ticket(issue):
 
     stack_base_branch = None
     stack_base_key = None
+    blocker_ticket = None
     if soft_blockers:
         if not cfg["claude"].get("stack_on_review"):
             blocker_list = ", ".join(f"{k} ({s})" for k, s in soft_blockers)
@@ -289,8 +290,30 @@ def pickup_ticket(issue):
     session_id = str(uuid.uuid4())
 
     if stack_base_branch:
-        log(f"{key}: creating worktree at {worktree_path} (branch {branch}, stacked on {stack_base_branch})")
-        procs.sh(f"git worktree add {worktree_path} -b {branch} {stack_base_branch}", cwd=repo_path, check=False)
+        # stack_base_branch from the local state DB (`blocker_ticket["branch"]`)
+        # already exists as a local branch in this repo — this pipeline created
+        # it. But stack_base_branch from `github.find_open_pr_branch` (the gh-
+        # search fallback, used when the blocker wasn't picked up by this
+        # pipeline) is just the bare head ref name of someone else's PR — it
+        # only exists on `origin`, never fetched/created locally, so `git
+        # worktree add -b <new> <bare-name>` fails with "not a valid object
+        # name" (bare-name only resolves as `origin/<bare-name>`). Caught
+        # live: RND-15003 stacking on RND-14699's manually-built PR branch
+        # `feat/RND-14699/video-feedback-reason-chips` failed every cycle this
+        # way. Fetch it fresh and build off `origin/<branch>` instead — covers
+        # both the branch-never-fetched case and the branch-fetched-but-stale
+        # case (a push since our last fetch).
+        found_via_gh = not (
+            blocker_ticket and blocker_ticket.get("branch") == stack_base_branch
+            and blocker_ticket.get("repo_path") == repo_path
+        )
+        if found_via_gh:
+            procs.sh(f"git fetch origin {procs.shlex.quote(stack_base_branch)}", cwd=repo_path, check=False, timeout=120)
+            stack_base_ref = f"origin/{stack_base_branch}"
+        else:
+            stack_base_ref = stack_base_branch
+        log(f"{key}: creating worktree at {worktree_path} (branch {branch}, stacked on {stack_base_ref})")
+        procs.sh(f"git worktree add {worktree_path} -b {branch} {stack_base_ref}", cwd=repo_path, check=False)
     else:
         log(f"{key}: creating worktree at {worktree_path} (branch {branch})")
         procs.sh(f"git worktree add {worktree_path} -b {branch}", cwd=repo_path, check=False)
