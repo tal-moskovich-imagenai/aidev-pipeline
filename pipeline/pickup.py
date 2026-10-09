@@ -15,6 +15,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import config, jira_client, state, procs, lockfile, github
 from lib.pipelog import get_logger
+from lib.notify import notify
 from lib.soul import soul_section, jira_live_fetch_note
 
 log = get_logger("pickup")
@@ -32,6 +33,7 @@ def mark_failed(key, reason):
         jira_client.set_state_label(key, "aidev-stuck")
     except Exception as e:
         log(f"{key}: could not post failure comment: {e}")
+    notify(f"aidev: {key} failed", reason, key=key, log=log)
 
 
 def build_task_prompt(issue, stack_base_key=None):
@@ -388,6 +390,8 @@ def pickup_ticket(issue):
             log(f"{key}: sprint-add warning: {e}")
 
     log(f"{key}: launched, session {session_id}")
+    notify(f"aidev: {key} picked up", f"Branch: {branch}" + (f" (stacked on {stack_base_key})" if stack_base_key else ""),
+           key=key, log=log)
     return True
 
 
