@@ -509,6 +509,21 @@ tmux attach -t aidev-<TICKET-KEY>   # watch/intervene in a live session
 cd worktrees/<TICKET-KEY> && claude --resume <session-id>   # resume yourself
 ```
 
+### A STUCK ticket never auto-fails from elapsed time
+
+Unlike a `RUNNING` session (still bounded by `max_running_hours` against a
+genuine crash/loop), a `STUCK` ticket — Claude asked a question and is
+waiting on a reply — is never auto-failed just because time passed. An idle
+tmux pane costs nothing, and a reply arriving an hour or a week later still
+gets picked up. If the pane itself is gone by the time the reply shows up
+(an old deploy's timeout, a reboot, a manual kill), `process_stuck_ticket`
+relaunches a fresh `claude --resume <session_id>` with the original
+question and the human's reply restated explicitly (conversation memory
+survives in `--resume`; there's no live pane left to type into). Either
+way, replying "proceed" (or any real answer) on a `STUCK` ticket's Jira
+issue is always enough to wake it back up — never move it to `In Progress`
+for this case, that's for the separate `DONE -> In Progress` rework loop.
+
 ### A ticket stuck "RUNNING" for hours with no progress
 
 `monitor.py` checks the tmux **session** exists and (separately) that the

@@ -158,7 +158,7 @@ def mark_failed(key, reason, tmux_name=None):
         log(f"{key}: could not post failure comment: {e}")
     if tmux_name:
         procs.tmux_kill(tmux_name)
-    notify(f"aidev: {key} failed", reason, key=key)
+    notify(f"aidev: {key} failed", reason, key=key, log=log)
 
 
 def build_crash_retry_prompt(key, stage):
@@ -297,6 +297,7 @@ def check_context_handoff(ticket):
                 f"Handoff doc: {doc_rel_path}",
                 key=key,
                 pr_url=ticket.get("pr_url"),
+                log=log,
             )
             return True
 
@@ -413,7 +414,7 @@ def process_running_ticket(ticket):
             jira_client.set_state_label(key, "aidev-stuck")
         except Exception as e:
             log(f"{key}: could not post stuck comment: {e}")
-        notify(f"aidev: {key} needs input", question, key=key, pr_url=ticket.get("pr_url"))
+        notify(f"aidev: {key} needs input", question, key=key, pr_url=ticket.get("pr_url"), log=log)
         return
     if status_file_is_stale(status):
         # Only treat this as a crash signal if the claude process is ALSO
@@ -819,27 +820,48 @@ def mark_review_done(ticket, pr_url, pr_out=None):
     procs.tmux_kill(tmux_name)
     log(f"{key}: done")
     notify(f"aidev: {key} done", "PR opened" if pr_url else "PR step had no URL — check comment",
-           key=key, pr_url=pr_url)
+           key=key, pr_url=pr_url, log=log)
+
+
+def build_stuck_reply_resume_prompt(key, stage, question, reply_text):
+    """Used only when a STUCK ticket's tmux pane is gone (timed out, machine
+    restarted, manually killed, etc.) by the time a human reply shows up.
+    A live pane just gets the reply typed into it (see process_stuck_ticket);
+    this is the no-live-pane path, so the resumed session needs the question
+    and the reply restated explicitly — `claude --resume` restores prior
+    conversation memory, but there is no live pane state to type into."""
+    return f"""{soul_section()}You are resuming work on Jira ticket {key}. You previously asked a
+question and paused, waiting for a human reply (your session's tmux pane is
+no longer running — a timeout or restart, not a rejection of your question —
+so this is a fresh process resuming your same conversation history):
+
+--- your question ---
+{question}
+--- end your question ---
+
+The human has now replied on the ticket:
+
+--- human reply ---
+{reply_text}
+--- end human reply ---
+
+Apply the reply and continue the ticket to completion. When done, write
+status.json's state to "complete" (or "needs_input" again only if a new,
+different question comes up).
+"""
 
 
 def process_stuck_ticket(ticket):
-    cfg = config.load()
     key = ticket["ticket_key"]
     tmux_name = ticket["tmux_session"]
-    max_hours = cfg["claude"].get("max_running_hours")
 
-    if not procs.tmux_session_exists(tmux_name):
-        mark_failed(key, "tmux session disappeared while STUCK (crash, reboot, or manual kill)")
-        return
-
-    elapsed = state.seconds_running(ticket)
-    if max_hours and elapsed and elapsed > max_hours * 3600:
-        mark_failed(
-            key,
-            f"stuck waiting for a reply past max_running_hours ({max_hours}h) with no response",
-            tmux_name=tmux_name,
-        )
-        return
+    # No elapsed-time auto-fail here, deliberately: STUCK means "waiting on
+    # a human," not "something is wrong." A tmux pane sitting idle costs
+    # nothing, and a reply arriving an hour or a week later should still be
+    # picked up — mirrors how `needs_input` is treated while the session is
+    # still live. (Runaway/looping *active* sessions are still bounded by
+    # `max_running_hours` in process_running_ticket — this only removes the
+    # timeout from the idle-waiting-for-a-human case.)
 
     try:
         comments = jira_client.get_comments(key)
@@ -860,8 +882,22 @@ def process_stuck_ticket(ticket):
     if last_seen == last["id"]:
         return
 
-    log(f"{key}: human reply found — resuming session with the reply")
-    procs.tmux_send(tmux_name, body_text.replace("\n", " "))
+    pane_alive = procs.tmux_session_exists(tmux_name)
+    if pane_alive:
+        log(f"{key}: human reply found — resuming session with the reply")
+        procs.tmux_send(tmux_name, body_text.replace("\n", " "))
+    else:
+        # Pane is gone (e.g. a prior build's max_running_hours timeout, a
+        # reboot, a manual kill) — `claude --resume` still has the full
+        # conversation on disk, so relaunch into a fresh pane instead of
+        # treating a dead pane as a dead ticket.
+        log(f"{key}: human reply found, but tmux pane is gone — relaunching a fresh session with the reply")
+        stage = ticket.get("stage") or "implement"
+        prompt = build_stuck_reply_resume_prompt(
+            key, stage, ticket.get("stuck_question") or "(question text not recorded)", body_text
+        )
+        relaunch_claude(ticket, prompt, stage=stage)
+
     state.set_last_comment_id(key, last["id"])
     state.clear_stuck(key)
     try:
@@ -1035,7 +1071,7 @@ def process_done_ticket(ticket):
             cleanup_worktree(ticket)
             state.set_archived(key)
             notify(f"aidev: {key} merged", "Merged directly on GitHub (not via auto-merge)",
-                   key=key, pr_url=pr_url)
+                   key=key, pr_url=pr_url, log=log)
             return
 
     try:
@@ -1081,7 +1117,7 @@ def process_done_ticket(ticket):
         log(f"{key}: could not post rework comment: {e}")
 
     notify(f"aidev: {key} rework started", "resuming session with full memory of prior work",
-           key=key, pr_url=ticket.get("pr_url"))
+           key=key, pr_url=ticket.get("pr_url"), log=log)
 
 
 AUTO_MERGE_LABEL = "aidev-auto-merge"
@@ -1121,7 +1157,7 @@ def escalate_auto_merge(ticket, reason, waiting_on_human=False):
     # — make sure escalating never silently drops the ticket out of DONE.
     state.set_state(key, "DONE")
     notify(f"aidev: {key} auto-merge {'waiting on human' if waiting_on_human else 'stuck'}", reason[:200],
-           key=key, pr_url=ticket.get("pr_url"))
+           key=key, pr_url=ticket.get("pr_url"), log=log)
 
 
 def build_auto_merge_conflict_prompt(key, summary, pr_url):
@@ -1549,7 +1585,7 @@ def process_auto_merge_ticket(ticket):
         cleanup_worktree(ticket)
         state.set_archived(key)
         notify(f"aidev: {key} merged", "Merged directly on GitHub (not via auto-merge)",
-               key=key, pr_url=pr_url)
+               key=key, pr_url=pr_url, log=log)
         return
 
     if details["baseRefName"] != "master":
@@ -1722,7 +1758,7 @@ def process_auto_merge_ticket(ticket):
         except Exception as e:
             log(f"{key}: could not post merge comment: {e}")
         state.set_stage(key, "implement")
-        notify(f"aidev: {key} auto-merged", "Merged to base branch", key=key, pr_url=pr_url)
+        notify(f"aidev: {key} auto-merged", "Merged to base branch", key=key, pr_url=pr_url, log=log)
         return
 
     if details.get("reviewRequests"):
