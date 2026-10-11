@@ -483,7 +483,8 @@ to master unattended, re-checked every cycle:
    `--squash`, never `--rebase`.
 9. **Success** → Jira ticket transitions to `Done`, with a comment linking
    the merge. **Any other failure** (the merge call itself fails
-   unexpectedly, no PR URL recorded, etc.) removes the `aidev-auto-merge`
+   unexpectedly, no PR URL recorded and no PR found for the ticket's branch,
+   etc.) removes the `aidev-auto-merge`
    label and comments why — re-tag once addressed to retry, same as tagging
    a ticket in the first place.
 
