@@ -112,11 +112,14 @@ def open_pr(ticket):
     # Normal case now: Claude opens its own PR (with a real title/description)
     # before marking status.json complete — reuse it rather than creating a
     # second one.
-    existing = procs.sh(
-        f"gh pr view {branch} --json url --jq .url", cwd=worktree_path, check=False
-    )
-    if existing and existing.startswith("https://"):
-        return existing.strip(), f"reused existing PR: {existing.strip()}"
+    existing = github.find_pr_url_for_branch(worktree_path, branch)
+    if existing:
+        return existing, f"reused existing PR: {existing}"
+
+    # The lookup above fails on a network blip; never let that drop a known PR URL.
+    if ticket.get("pr_url"):
+        log(f"{key}: PR lookup failed — reusing recorded PR {ticket['pr_url']}")
+        return ticket["pr_url"], f"reused recorded PR: {ticket['pr_url']}"
 
     # Fallback only: Claude should have opened this itself. If we're here,
     # something went wrong upstream — this placeholder unblocks the pipeline
@@ -546,6 +549,8 @@ def finish_ticket(ticket):
         return
 
     state.clear_postprocess_failure(key)
+    if pr_url:
+        state.set_state(key, "POSTPROCESS", pr_url=pr_url)
 
     if not pr_url:
         mark_review_done(ticket, pr_url, pr_out)
@@ -1556,8 +1561,13 @@ def process_auto_merge_ticket(ticket):
         return
 
     if not pr_url:
-        escalate_auto_merge(ticket, "no PR URL recorded for this ticket")
-        return
+        pr_url = github.find_pr_url_for_branch(repo_path, branch)
+        if not pr_url:
+            escalate_auto_merge(ticket, f"no PR URL recorded for this ticket and no PR found for branch {branch}")
+            return
+        log(f"{key}: no PR URL recorded — recovered {pr_url} from branch {branch}")
+        state.set_state(key, ticket["state"], pr_url=pr_url)
+        ticket = {**ticket, "pr_url": pr_url}
 
     details = github.get_pr_details(repo_path, pr_url)
     if not details:

@@ -28,6 +28,18 @@ def find_open_pr_branch(repo_path, ticket_key):
     return candidates[0]["headRefName"]
 
 
+def find_pr_url_for_branch(repo_path, branch):
+    """Returns the URL of the PR whose head is `branch`, or None on any
+    failure (no PR, gh not authenticated, network)."""
+    out = procs.sh(
+        f"gh pr view {procs.shlex.quote(branch)} --json url --jq .url",
+        cwd=repo_path, check=False,
+    )
+    if out and out.startswith("https://"):
+        return out.strip()
+    return None
+
+
 def get_pr_comments(repo_path, pr_url):
     """Returns a PR's issue-level comments (author, body, createdAt), oldest
     first — same shape as jira_client.get_comments, so callers can treat
